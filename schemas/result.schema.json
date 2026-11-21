@@ -1,75 +1,141 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "result",
+  "$id": "https://academic-slide-skill/schemas/result.schema.json",
+  "title": "Skill run result",
   "type": "object",
-  "required": ["case_id", "status", "artifacts"],
-  "additionalProperties": true,
+  "required": ["case_id", "skill", "status", "constraints", "artifacts", "evidence_map", "qa_prep", "sources", "uncertainty", "change_records", "limitations"],
+  "additionalProperties": false,
   "properties": {
     "case_id": {"type": "string"},
-    "status": {"type": "string", "enum": ["success", "partial", "failed"]},
-    "title": {"type": ["string", "null"]},
-    "summary": {
+    "skill": {
       "type": "object",
+      "required": ["name", "version", "planner", "started_at", "finished_at", "duration_seconds"],
+      "additionalProperties": false,
       "properties": {
-        "spine": {"type": "object"},
-        "slide_count": {"type": "integer", "minimum": 0},
-        "cap": {"type": ["integer", "null"]},
-        "language": {"type": ["string", "null"]},
-        "audience": {"type": ["string", "null"]},
-        "minutes": {"type": ["integer", "null"]}
+        "name": {"type": "string"},
+        "version": {"type": "string"},
+        "planner": {"type": "string", "enum": ["semantic", "deterministic_fallback"]},
+        "model_used": {"type": ["string", "null"]},
+        "started_at": {"type": "string"},
+        "finished_at": {"type": "string"},
+        "duration_seconds": {"type": "number", "minimum": 0}
+      }
+    },
+    "status": {"type": "string", "enum": ["complete", "partial", "blocked"]},
+    "status_detail": {"type": "string"},
+    "constraints": {
+      "type": "object",
+      "required": ["audience", "audience_profile", "time_minutes", "max_slides", "talk_slides", "backup_slides"],
+      "additionalProperties": true,
+      "properties": {
+        "audience": {"type": "string"},
+        "audience_profile": {"type": "string"},
+        "time_minutes": {"type": "number"},
+        "max_slides": {"type": "integer"},
+        "talk_slides": {"type": "integer"},
+        "backup_slides": {"type": "integer"}
       }
     },
     "artifacts": {
       "type": "object",
-      "required": ["editable_presentation", "pdf_preview"],
+      "required": ["deck_pptx", "deck_pdf", "previews_dir", "slide_plan", "evidence_map", "speaker_notes"],
+      "additionalProperties": false,
       "properties": {
-        "editable_presentation": {"type": "string"},
-        "pdf_preview": {"type": "string"},
-        "png_previews": {"type": "array", "items": {"type": "string"}},
-        "evidence_map": {
-          "type": "object",
-          "properties": {
-            "json": {"type": "string"},
-            "csv": {"type": "string"},
-            "xlsx": {"type": "string"}
-          }
-        },
+        "deck_pptx": {"type": "string"},
+        "deck_pdf": {"type": ["string", "null"]},
+        "previews_dir": {"type": "string"},
+        "preview_pngs": {"type": "array", "items": {"type": "string"}},
         "slide_plan": {"type": "string"},
-        "qa_report": {"type": "string"},
-        "paper_extraction": {"type": "string"}
+        "evidence_map": {"type": "string"},
+        "speaker_notes": {"type": "string"}
       }
     },
-    "evidence": {
+    "evidence_map": {
       "type": "array",
+      "minItems": 1,
       "items": {
         "type": "object",
+        "required": ["slide_no", "role", "title", "evidence", "verbatim_check"],
+        "additionalProperties": false,
         "properties": {
-          "slide_no": {"type": "integer"},
+          "slide_no": {"type": "integer", "minimum": 1},
+          "backup": {"type": "boolean"},
           "role": {"type": "string"},
-          "claim": {"type": "string"},
-          "source_label": {"type": "string"},
-          "sources": {
+          "title": {"type": "string"},
+          "evidence": {
             "type": "array",
             "items": {
               "type": "object",
+              "required": ["kind", "page"],
+              "additionalProperties": false,
               "properties": {
-                "kind": {"type": "string"},
-                "source_id": {"type": ["string", "null"]},
-                "page": {"type": ["integer", "null"]},
-                "section": {"type": ["string", "null"]},
-                "verbatim_quote": {"type": "string"}
+                "kind": {"type": "string", "enum": ["figure", "table", "page", "section", "abstract"]},
+                "id": {"type": "string"},
+                "page": {"type": "integer", "minimum": 1},
+                "section": {"type": "string"},
+                "quote": {"type": "string"}
               }
             }
-          }
+          },
+          "verbatim_check": {"type": "string", "enum": ["verified", "paraphrased", "flagged", "no_claim"]}
         }
       }
     },
-    "sources": {"type": "array"},
+    "qa_prep": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["category", "question", "answer_points", "backup_slide_no"],
+        "additionalProperties": false,
+        "properties": {
+          "category": {"type": "string"},
+          "question": {"type": "string"},
+          "answer_points": {"type": "array", "items": {"type": "string"}},
+          "backup_slide_no": {"type": ["integer", "null"]}
+        }
+      }
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "role", "kind", "sha256", "pages"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {"type": "string"},
+          "role": {"type": "string", "enum": ["paper", "template", "starting_deck", "doc", "image", "data", "other"]},
+          "kind": {"type": "string"},
+          "sha256": {"type": "string"},
+          "pages": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "rendering": {
+      "type": "object",
+      "required": ["engine", "fonts", "theme", "qa_findings"],
+      "additionalProperties": false,
+      "properties": {
+        "engine": {"type": "string"},
+        "fonts": {"type": "array", "items": {"type": "string"}},
+        "theme": {"type": "string"},
+        "qa_findings": {"type": "array", "items": {"type": "string"}}
+      }
+    },
     "uncertainty": {"type": "array", "items": {"type": "string"}},
-    "warnings": {"type": "array", "items": {"type": "string"}},
-    "errors": {"type": "array", "items": {"type": "string"}},
-    "change_records": {"type": "array"},
-    "environment": {"type": "object"},
-    "output_contract_version": {"type": "string"}
+    "change_records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["at", "stage", "action"],
+        "additionalProperties": false,
+        "properties": {
+          "at": {"type": "string"},
+          "stage": {"type": "string"},
+          "action": {"type": "string"},
+          "detail": {"type": "string"}
+        }
+      }
+    },
+    "limitations": {"type": "array", "items": {"type": "string"}}
   }
 }

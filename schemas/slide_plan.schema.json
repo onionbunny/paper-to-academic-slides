@@ -1,30 +1,39 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "slide_plan",
+  "$id": "https://academic-slide-skill/schemas/slide_plan.schema.json",
+  "title": "Academic slide plan",
   "type": "object",
-  "required": ["version", "slides"],
-  "additionalProperties": true,
+  "required": ["version", "case_id", "planner", "language", "constraints", "spine", "slides", "qa_prep", "uncertainty"],
+  "additionalProperties": false,
   "properties": {
     "version": {"type": "string"},
-    "case_id": {"type": ["string", "null"]},
-    "planner": {"type": "string", "enum": ["semantic_agent", "deterministic_fallback"]},
-    "language": {"type": "string", "enum": ["zh", "en"]},
+    "case_id": {"type": "string"},
+    "planner": {"type": "string", "enum": ["semantic", "deterministic_fallback"]},
+    "language": {"type": "string", "enum": ["en", "zh"]},
     "constraints": {
       "type": "object",
+      "required": ["audience", "audience_profile", "time_minutes", "max_slides", "talk_slides", "backup_slides", "seconds_per_slide"],
+      "additionalProperties": true,
       "properties": {
-        "max_slides": {"type": ["integer", "null"], "minimum": 1},
-        "minutes": {"type": ["integer", "null"], "minimum": 1},
-        "audience": {"type": ["string", "null"]}
+        "audience": {"type": "string"},
+        "audience_profile": {"type": "string", "enum": ["domain_expert", "mixed_seminar", "committee", "collaborator", "general"]},
+        "time_minutes": {"type": "number", "minimum": 1},
+        "max_slides": {"type": "integer", "minimum": 1},
+        "talk_slides": {"type": "integer", "minimum": 1},
+        "backup_slides": {"type": "integer", "minimum": 0},
+        "seconds_per_slide": {"type": "number", "minimum": 1}
       }
     },
     "spine": {
       "type": "object",
+      "required": ["problem", "gap", "approach", "key_evidence", "contributions", "limitations"],
+      "additionalProperties": false,
       "properties": {
         "problem": {"type": "string"},
         "gap": {"type": "string"},
-        "method": {"type": "string"},
-        "key_results": {"type": "array", "items": {"type": "string"}},
-        "contribution": {"type": "string"},
+        "approach": {"type": "string"},
+        "key_evidence": {"type": "array", "items": {"type": "string"}},
+        "contributions": {"type": "array", "items": {"type": "string"}},
         "limitations": {"type": "array", "items": {"type": "string"}}
       }
     },
@@ -33,63 +42,75 @@
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["role", "title"],
-        "additionalProperties": true,
+        "required": ["slide_no", "role", "backup", "title", "bullets", "figures", "tables", "evidence", "evidence_strength", "notes", "timing_seconds"],
+        "additionalProperties": false,
         "properties": {
           "slide_no": {"type": "integer", "minimum": 1},
-          "role": {"type": "string", "enum": ["title", "section", "content", "figure", "table", "conclusion", "backup"]},
-          "layout_role": {"type": "string", "enum": ["title", "section", "content", "figure", "blank"]},
-          "title": {"type": "string", "maxLength": 200},
-          "claim": {"type": "string"},
+          "role": {"type": "string", "enum": ["title", "background", "problem", "gap", "method", "mechanism", "result", "comparison", "contribution", "limitation", "conclusion", "divider", "backup"]},
+          "backup": {"type": "boolean"},
+          "title": {"type": "string", "minLength": 1, "maxLength": 110},
           "bullets": {
             "type": "array",
+            "maxItems": 6,
             "items": {
               "type": "object",
-              "required": ["text"],
+              "required": ["text", "level"],
+              "additionalProperties": false,
               "properties": {
-                "text": {"type": "string", "maxLength": 220},
-                "level": {"type": "integer", "minimum": 0, "maximum": 3}
+                "text": {"type": "string", "minLength": 1, "maxLength": 220},
+                "level": {"type": "integer", "minimum": 0, "maximum": 2}
               }
             }
           },
-          "figures": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "required": ["id"],
-              "properties": {
-                "id": {"type": "string"},
-                "kind": {"type": "string"},
-                "asset_path": {"type": "string"},
-                "caption_verbatim": {"type": "string"},
-                "is_schematic": {"type": "boolean"},
-                "is_cited_work": {"type": "boolean"}
-              }
-            }
-          },
-          "tables": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "required": ["id"],
-              "properties": {"id": {"type": "string"}}
-            }
-          },
+          "figures": {"type": "array", "items": {"type": "string"}},
+          "tables": {"type": "array", "items": {"type": "string"}},
           "evidence": {
             "type": "array",
             "items": {
               "type": "object",
+              "required": ["kind", "page"],
+              "additionalProperties": false,
               "properties": {
-                "kind": {"type": "string", "enum": ["figure", "table", "section", "page"]},
-                "id": {"type": ["string", "null"]},
-                "page": {"type": ["integer", "null"], "minimum": 1},
-                "section": {"type": ["string", "null"]},
-                "quote": {"type": "string"}
+                "kind": {"type": "string", "enum": ["figure", "table", "page", "section", "abstract"]},
+                "id": {"type": "string"},
+                "page": {"type": "integer", "minimum": 1},
+                "section": {"type": "string"},
+                "quote": {"type": "string", "maxLength": 400}
               }
             }
           },
-          "notes": {"type": "string"},
+          "evidence_strength": {"type": "string", "enum": ["direct", "comparative", "mechanistic", "background"]},
+          "notes": {"type": "string", "minLength": 20, "maxLength": 1200},
+          "timing_seconds": {"type": "number", "minimum": 5},
           "source_label": {"type": "string"}
+        }
+      }
+    },
+    "qa_prep": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["category", "question", "answer_points", "evidence"],
+        "additionalProperties": false,
+        "properties": {
+          "category": {"type": "string", "enum": ["mechanism", "data", "controls", "limitation", "general"]},
+          "question": {"type": "string", "minLength": 5},
+          "answer_points": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["kind", "page"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"type": "string", "enum": ["figure", "table", "page", "section", "abstract"]},
+                "id": {"type": "string"},
+                "page": {"type": "integer", "minimum": 1},
+                "quote": {"type": "string", "maxLength": 400}
+              }
+            }
+          },
+          "backup_slide_no": {"type": ["integer", "null"], "minimum": 1}
         }
       }
     },
