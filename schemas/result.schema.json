@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "result",
+  "type": "object",
+  "required": ["case_id", "status", "artifacts"],
+  "additionalProperties": true,
+  "properties": {
+    "case_id": {"type": "string"},
+    "status": {"type": "string", "enum": ["success", "partial", "failed"]},
+    "title": {"type": ["string", "null"]},
+    "summary": {
+      "type": "object",
+      "properties": {
+        "spine": {"type": "object"},
+        "slide_count": {"type": "integer", "minimum": 0},
+        "cap": {"type": ["integer", "null"]},
+        "language": {"type": ["string", "null"]},
+        "audience": {"type": ["string", "null"]},
+        "minutes": {"type": ["integer", "null"]}
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "required": ["editable_presentation", "pdf_preview"],
+      "properties": {
+        "editable_presentation": {"type": "string"},
+        "pdf_preview": {"type": "string"},
+        "png_previews": {"type": "array", "items": {"type": "string"}},
+        "evidence_map": {
+          "type": "object",
+          "properties": {
+            "json": {"type": "string"},
+            "csv": {"type": "string"},
+            "xlsx": {"type": "string"}
+          }
+        },
+        "slide_plan": {"type": "string"},
+        "qa_report": {"type": "string"},
+        "paper_extraction": {"type": "string"}
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "slide_no": {"type": "integer"},
+          "role": {"type": "string"},
+          "claim": {"type": "string"},
+          "source_label": {"type": "string"},
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {"type": "string"},
+                "source_id": {"type": ["string", "null"]},
+                "page": {"type": ["integer", "null"]},
+                "section": {"type": ["string", "null"]},
+                "verbatim_quote": {"type": "string"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "sources": {"type": "array"},
+    "uncertainty": {"type": "array", "items": {"type": "string"}},
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "errors": {"type": "array", "items": {"type": "string"}},
+    "change_records": {"type": "array"},
+    "environment": {"type": "object"},
+    "output_contract_version": {"type": "string"}
+  }
+}

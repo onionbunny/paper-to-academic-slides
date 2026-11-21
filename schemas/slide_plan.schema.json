@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "slide_plan",
+  "type": "object",
+  "required": ["version", "slides"],
+  "additionalProperties": true,
+  "properties": {
+    "version": {"type": "string"},
+    "case_id": {"type": ["string", "null"]},
+    "planner": {"type": "string", "enum": ["semantic_agent", "deterministic_fallback"]},
+    "language": {"type": "string", "enum": ["zh", "en"]},
+    "constraints": {
+      "type": "object",
+      "properties": {
+        "max_slides": {"type": ["integer", "null"], "minimum": 1},
+        "minutes": {"type": ["integer", "null"], "minimum": 1},
+        "audience": {"type": ["string", "null"]}
+      }
+    },
+    "spine": {
+      "type": "object",
+      "properties": {
+        "problem": {"type": "string"},
+        "gap": {"type": "string"},
+        "method": {"type": "string"},
+        "key_results": {"type": "array", "items": {"type": "string"}},
+        "contribution": {"type": "string"},
+        "limitations": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "slides": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["role", "title"],
+        "additionalProperties": true,
+        "properties": {
+          "slide_no": {"type": "integer", "minimum": 1},
+          "role": {"type": "string", "enum": ["title", "section", "content", "figure", "table", "conclusion", "backup"]},
+          "layout_role": {"type": "string", "enum": ["title", "section", "content", "figure", "blank"]},
+          "title": {"type": "string", "maxLength": 200},
+          "claim": {"type": "string"},
+          "bullets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["text"],
+              "properties": {
+                "text": {"type": "string", "maxLength": 220},
+                "level": {"type": "integer", "minimum": 0, "maximum": 3}
+              }
+            }
+          },
+          "figures": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id"],
+              "properties": {
+                "id": {"type": "string"},
+                "kind": {"type": "string"},
+                "asset_path": {"type": "string"},
+                "caption_verbatim": {"type": "string"},
+                "is_schematic": {"type": "boolean"},
+                "is_cited_work": {"type": "boolean"}
+              }
+            }
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id"],
+              "properties": {"id": {"type": "string"}}
+            }
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {"type": "string", "enum": ["figure", "table", "section", "page"]},
+                "id": {"type": ["string", "null"]},
+                "page": {"type": ["integer", "null"], "minimum": 1},
+                "section": {"type": ["string", "null"]},
+                "quote": {"type": "string"}
+              }
+            }
+          },
+          "notes": {"type": "string"},
+          "source_label": {"type": "string"}
+        }
+      }
+    },
+    "uncertainty": {"type": "array", "items": {"type": "string"}},
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  }
+}
