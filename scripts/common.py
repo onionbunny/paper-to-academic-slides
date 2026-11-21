@@ -1,7 +1,8 @@
-"""Shared helpers for the paper-to-academic-slides skill.
+"""Shared helpers for the academic-deck organizer skill.
 
-All paths are absolute; the skill never assumes the current working directory.
-The module is intentionally dependency-light so every stage can import it.
+All paths are resolvable at runtime: the harness uses /input, /app/work and
+/app/output, while local testing can override them with CLI flags or the
+SKILL_INPUT_DIR / SKILL_WORK_DIR / SKILL_OUTPUT_DIR environment variables.
 """
 from __future__ import annotations
 
@@ -11,63 +12,59 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-EMU_PER_INCH = 914400
-PT_PER_INCH = 72.0
-
 # ---------------------------------------------------------------------------
-# Paths with runtime defaults (evaluator contract) and overridable env vars
+# Resolved directories
 # ---------------------------------------------------------------------------
 INPUT_DIR = Path(os.environ.get("SKILL_INPUT_DIR", "/input"))
 WORK_DIR = Path(os.environ.get("SKILL_WORK_DIR", "/app/work"))
 OUTPUT_DIR = Path(os.environ.get("SKILL_OUTPUT_DIR", "/app/output"))
 
-PAPER_JSON = "paper.json"
+# Canonical file names inside the work directory
 CASE_BRIEF = "case_brief.json"
+PAPER_JSON = "paper.json"
+PAPER_REVIEW = "paper_review.md"
 TEMPLATE_JSON = "template.json"
 SLIDE_PLAN = "slide_plan.json"
-QA_REPORT = "qa_report.json"
+BUILD_REPORT = "build_report.json"
 RENDER_JSON = "render.json"
-RESULT_JSON = "result.json"
-CHANGE_LOG = "change_records.json"
+QA_REPORT = "qa_report.json"
+CHANGE_RECORDS = "change_records.json"
+PLAN_LOG = "plan_log.json"
+
+ASSETS_DIR = "assets"
+RENDER_DIR = "render"
+TPL_THUMBS_DIR = "template_thumbs"
 
 
 def ts() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
 
 
 # ---------------------------------------------------------------------------
-# JSON / IO
+# IO helpers
 # ---------------------------------------------------------------------------
 def read_json(path: str | Path, default=None):
-    path = Path(path)
-    if not path.exists():
-        if default is not None:
-            return default
-        raise FileNotFoundError(path)
-    with path.open("r", encoding="utf-8") as fh:
+    p = Path(path)
+    if not p.exists():
+        return default
+    with p.open("r", encoding="utf-8") as fh:
         return json.load(fh)
 
 
 def write_json(path: str | Path, data) -> Path:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fh:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)
-    return path
+    return p
 
 
 def read_text(path: str | Path) -> str:
-    for enc in ("utf-8", "utf-8-sig", "gb18030", "latin-1"):
-        try:
-            return Path(path).read_text(encoding=enc)
-        except UnicodeDecodeError:
-            continue
-    return Path(path).read_text(errors="replace")
+    return Path(path).read_text(encoding="utf-8", errors="replace")
 
 
 def ensure_dir(path: str | Path) -> Path:
@@ -84,48 +81,40 @@ def copy_file(src: str | Path, dst: str | Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Change records (audit trail of every mutating action)
+# Change log (every mutation is recorded so the run can be re-audited)
 # ---------------------------------------------------------------------------
 class ChangeLog:
     def __init__(self, work_dir: str | Path):
-        self.path = Path(work_dir) / CHANGE_LOG
-        self.records = read_json(self.path, default=[])
+        self.path = Path(work_dir) / CHANGE_RECORDS
+        self.records = read_json(self.path, default=[]) or []
 
     def add(self, stage: str, action: str, detail: str) -> None:
-        self.records.append(
-            {"timestamp": ts(), "stage": stage, "action": action, "detail": detail}
-        )
+        self.records.append({"time": ts(), "stage": stage, "action": action, "detail": detail})
         write_json(self.path, self.records)
 
 
-# ---------------------------------------------------------------------------
-# Logging that also streams to stdout for the native trace
-# ---------------------------------------------------------------------------
 def get_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
     if not logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
         logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
     return logger
 
 
-log = get_logger("paper2slides")
-
-
-# ---------------------------------------------------------------------------
-# Subprocess helper (LibreOffice / poppler)
-# ---------------------------------------------------------------------------
-def run_cmd(cmd: list[str], timeout: int = 300, cwd: str | Path | None = None) -> tuple[int, str, str]:
-    proc = subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    return proc.returncode, proc.stdout, proc.stderr
+def run_cmd(cmd: list[str], timeout: int = 300, cwd: str | Path | None = None,
+            env: dict | None = None) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(
+            cmd, timeout=timeout, cwd=str(cwd) if cwd else None,
+            env=env, capture_output=True, text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired as exc:
+        return 124, exc.stdout or "", f"timeout after {timeout}s: {' '.join(cmd)}"
+    except FileNotFoundError as exc:
+        return 127, "", str(exc)
 
 
 def which(binary: str) -> str | None:
@@ -133,176 +122,166 @@ def which(binary: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Language / text helpers
+# Text helpers
 # ---------------------------------------------------------------------------
-CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+_CJK_RE = re.compile(r"[一-鿿㐀-䶿]")
 
 
 def has_cjk(text: str) -> bool:
-    return bool(CJK_RE.search(text or ""))
+    return bool(_CJK_RE.search(text or ""))
 
 
 def cjk_ratio(text: str) -> float:
     if not text:
         return 0.0
-    return len(CJK_RE.findall(text)) / max(1, len(text))
+    return len(_CJK_RE.findall(text)) / max(1, len(text))
+
+
+_WS_RE = re.compile(r"\s+")
+# hyphen followed by any whitespace: covers "wide-\nspread" and "wide- spread"
+_HYPHEN_RE = re.compile(r"(\w)-\s+(\w)")
 
 
 def normalize_text(text: str) -> str:
-    """Lowercase, collapse whitespace and punctuation variants for matching."""
+    """Collapse whitespace and line-break hyphenation for verbatim checks."""
     if not text:
         return ""
-    text = text.replace("（", "(").replace("）", ")").replace("，", ",")
-    text = text.replace("：", ":").replace("；", ";").replace("－", "-").replace("–", "-")
-    return re.sub(r"\s+", "", text).lower()
+    prev = None
+    while prev != text:  # repeated substitution handles chained breaks
+        prev = text
+        text = _HYPHEN_RE.sub(r"\1\2", text)
+    text = text.replace("\n", " ").replace("\r", " ")
+    return _WS_RE.sub(" ", text).strip()
 
 
 def dehyphenate(text: str) -> str:
-    """Join line-break hyphenation: 'informa-\\ntion' -> 'information'.
-    Keep the hyphen when the next line starts with a capital (proper compound)."""
-    if not text:
-        return ""
-    return re.sub(r"([A-Za-z])-\n([a-z])", r"\1\2", text)
+    prev = None
+    while prev != text:
+        prev = text
+        text = _HYPHEN_RE.sub(r"\1\2", text)
+    return text
 
 
 def truncate_words(text: str, max_chars: int) -> str:
     text = (text or "").strip()
     if len(text) <= max_chars:
         return text
-    cut = text[: max_chars - 1]
-    # prefer a clean break at the last sentence/phrase boundary
-    for sep in ("。", ".", ";", "；", ",", "，", " "):
-        pos = cut.rfind(sep)
-        if pos > max_chars * 0.5:
-            return cut[: pos + 1].strip()
-    return cut.strip()
+    cut = text[:max_chars].rsplit(" ", 1)[0]
+    return cut + " …"
 
 
 # ---------------------------------------------------------------------------
-# Font policy: cross-platform substitution table
+# Font resolution
 # ---------------------------------------------------------------------------
-FONT_ALIASES = {
-    "microsoft yahei": "Noto Sans CJK SC",
-    "微软雅黑": "Noto Sans CJK SC",
-    "pingfang sc": "Noto Sans CJK SC",
-    "heiti sc": "Noto Sans CJK SC",
-    "simhei": "Noto Sans CJK SC",
-    "黑体": "Noto Sans CJK SC",
-    "dengxian": "Noto Sans CJK SC",
-    "simsun": "Noto Serif CJK SC",
-    "宋体": "Noto Serif CJK SC",
-    "stsong": "Noto Serif CJK SC",
-    "fangsong": "Noto Serif CJK SC",
-    "仿宋": "Noto Serif CJK SC",
-    "kaiti": "Noto Serif CJK SC",
-    "楷体": "Noto Serif CJK SC",
-    "calibri": "Carlito",
-    "carlito": "Carlito",
-    "arial": "Liberation Sans",
-    "helvetica": "Liberation Sans",
-    "times new roman": "Liberation Serif",
-    "cambria": "Caladea",
-    "caladea": "Caladea",
-    "georgia": "Liberation Serif",
-}
-
-DEFAULT_LATIN = "Carlito"
-DEFAULT_LATIN_FALLBACK = "Liberation Sans"
-DEFAULT_CJK_SANS = "Noto Sans CJK SC"
-DEFAULT_CJK_SERIF = "Noto Serif CJK SC"
+_FONT_CACHE: set[str] | None = None
 
 
 def _available_fonts() -> set[str]:
-    """Return the set of font family names available on this machine."""
-    cache_attr = "_font_cache"
-    if hasattr(_available_fonts, cache_attr):
-        return getattr(_available_fonts, cache_attr)
-    names: set[str] = set()
-    try:
-        if sys.platform.startswith("linux") and which("fc-list"):
-            code, out, _ = run_cmd(["fc-list", ":", "family"], timeout=60)
-            if code == 0:
-                for line in out.splitlines():
-                    for part in line.split(","):
-                        names.add(part.strip().lower())
-        elif sys.platform == "win32":
-            font_dir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
-            if font_dir.exists():
-                for f in font_dir.glob("*"):
-                    names.add(f.stem.lower())
-    except Exception as exc:  # pragma: no cover - defensive
-        log.warning("font discovery failed: %s", exc)
-    setattr(_available_fonts, cache_attr, names)
-    return names
+    global _FONT_CACHE
+    if _FONT_CACHE is not None:
+        return _FONT_CACHE
+    fonts: set[str] = set()
+    if which("fc-list"):
+        code, out, _ = run_cmd(["fc-list", ":", "family"], timeout=60)
+        if code == 0:
+            for line in out.splitlines():
+                for name in line.split(","):
+                    fonts.add(name.strip())
+    _FONT_CACHE = fonts
+    return fonts
 
 
 def resolve_font(preferred: str | None, cjk: bool, serif: bool = False) -> str:
-    """Map a requested family to an installed, metric-compatible font."""
+    """Return a font family that is actually installed; never assume one."""
     available = _available_fonts()
-    candidates: list[str] = []
-    if preferred:
-        aliased = FONT_ALIASES.get(preferred.lower().strip(), preferred.strip())
-        candidates.append(aliased)
+    if preferred and preferred in available:
+        return preferred
     if cjk:
-        candidates.append(DEFAULT_CJK_SERIF if serif else DEFAULT_CJK_SANS)
+        candidates = ["Noto Sans CJK SC", "Noto Serif CJK SC", "WenQuanYi Zen Hei",
+                      "Source Han Sans SC", "SimHei"]
+        if serif:
+            candidates = ["Noto Serif CJK SC", "Noto Sans CJK SC", "Source Han Serif SC"]
     else:
-        candidates.append(DEFAULT_LATIN)
-        candidates.append(DEFAULT_LATIN_FALLBACK)
-    for cand in candidates:
-        if not cand:
-            continue
-        if not available:  # cannot verify; trust the candidate
-            return cand
-        if cand.lower() in available:
-            return cand
-        # ttc collections expose e.g. "noto sans cjk sc" exactly; also try loose match
-        for known in available:
-            if cand.lower() in known or known in cand.lower():
-                return cand
-    return candidates[-1] if candidates else (DEFAULT_CJK_SANS if cjk else DEFAULT_LATIN_FALLBACK)
+        candidates = (["Liberation Serif", "DejaVu Serif", "Noto Serif"]
+                      if serif else
+                      ["Liberation Sans", "DejaVu Sans", "Noto Sans", "Arial"])
+    for name in candidates:
+        if name in available:
+            return name
+    return candidates[-1]
 
 
 # ---------------------------------------------------------------------------
-# Geometry helpers (python-pptx Emu <-> inches)
+# Geometry helpers (PDF points)
 # ---------------------------------------------------------------------------
-def emu_to_inch(value) -> float | None:
-    if value is None:
-        return None
-    return value / EMU_PER_INCH
-
-
-def inch(value: float) -> int:
-    return int(round(value * EMU_PER_INCH))
-
-
-def rects_overlap(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
+def rects_overlap(a: tuple[float, float, float, float],
+                  b: tuple[float, float, float, float]) -> bool:
     return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
 
 
-def merge_rects(rects: list[tuple[float, float, float, float]], gap: float = 0.15) -> list[tuple[float, float, float, float]]:
-    """Merge rectangles that overlap or sit within `gap` inches."""
-    if not rects:
-        return []
-    rects = [tuple(r) for r in rects]
-    merged = True
-    while merged:
-        merged = False
-        out: list[tuple[float, float, float, float]] = []
-        used = [False] * len(rects)
-        for i, r in enumerate(rects):
-            if used[i]:
-                continue
-            cur = list(r)
-            for j in range(i + 1, len(rects)):
-                if used[j]:
-                    continue
-                s = rects[j]
-                expanded = (cur[0] - gap, cur[1] - gap, cur[2] + gap, cur[3] + gap)
-                if rects_overlap(expanded, s):
-                    cur = [min(cur[0], s[0]), min(cur[1], s[1]), max(cur[2], s[2]), max(cur[3], s[3])]
-                    used[j] = True
-                    merged = True
-            used[i] = True
-            out.append(tuple(cur))
-        rects = out
-    return rects
+def rect_area(r: tuple[float, float, float, float]) -> float:
+    return max(0.0, r[2] - r[0]) * max(0.0, r[3] - r[1])
+
+
+def merge_rects(rects: list[tuple[float, float, float, float]],
+                gap: float = 0.15) -> list[tuple[float, float, float, float]]:
+    """Union rects that overlap or sit within `gap` points (single pass clusters)."""
+    clusters: list[list[float]] = []
+    for r in rects:
+        placed = False
+        for c in clusters:
+            expanded = (c[0] - gap, c[1] - gap, c[2] + gap, c[3] + gap)
+            if rects_overlap(expanded, r):
+                c[0] = min(c[0], r[0]); c[1] = min(c[1], r[1])
+                c[2] = max(c[2], r[2]); c[3] = max(c[3], r[3])
+                placed = True
+                break
+        if not placed:
+            clusters.append([r[0], r[1], r[2], r[3]])
+    # repeat until stable (new merges may become possible)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                a, b = clusters[i], clusters[j]
+                if rects_overlap((a[0] - gap, a[1] - gap, a[2] + gap, a[3] + gap), b):
+                    a[0] = min(a[0], b[0]); a[1] = min(a[1], b[1])
+                    a[2] = max(a[2], b[2]); a[3] = max(a[3], b[3])
+                    clusters.pop(j)
+                    changed = True
+                    break
+            if changed:
+                break
+    return [tuple(c) for c in clusters]
+
+
+def cluster_rects(rects, gap: float = 6.0):
+    """Alias kept for call sites that think in clustering terms."""
+    return merge_rects(rects, gap=gap)
+
+
+def env_fingerprint() -> dict:
+    import platform
+    info = {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        import pptx, fitz, pdfplumber, PIL
+        info["lib_versions"] = {
+            "python_pptx": pptx.__version__, "pymupdf": fitz.VersionBind,
+            "pdfplumber": pdfplumber.__version__, "pillow": PIL.__version__,
+        }
+    except Exception as exc:  # pragma: no cover
+        info["lib_versions_error"] = str(exc)
+    if which("soffice"):
+        code, out, _ = run_cmd(["soffice", "--version"], timeout=30)
+        if code == 0:
+            info["libreoffice"] = out.strip()
+    return info
+
+
+def sleep_or_return(seconds: float) -> None:
+    time.sleep(seconds)

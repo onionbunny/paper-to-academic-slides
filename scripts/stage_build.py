@@ -1,467 +1,332 @@
-"""Stage 4 — build the editable academic deck with python-pptx.
+"""Build the editable PPTX from a validated slide plan.
 
-The deck is built on the real frozen template/starting deck (masters, layouts,
-theme colors and footers are never overwritten). Slides use real title
-placeholders; wide content layouts are selected and their body placeholders are
-replaced with native, contain-fitted pictures (never cropped), verbatim
-captions, native tables and separated speaker notes. Deterministic text
-fitting prevents overflow and the font policy prevents substitution on export.
+Three source modes are handled honestly:
+  * starting deck / template: the real file is opened, its master, theme and
+    size preserved, slides built on its layouts;
+  * no deck: a fresh 16:9 presentation built on the scholar-default theme.
+
+Figures are real image files, tables are native editable PowerPoint tables,
+and speaker notes are embedded on every slide. Missing assets become
+explicit placeholders, never fabricated images.
 """
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 
-from PIL import Image
+from common import (
+    BUILD_REPORT, CASE_BRIEF, OUTPUT_DIR, PAPER_JSON, SLIDE_PLAN, TEMPLATE_JSON,
+    ChangeLog, get_logger, read_json, write_json,
+)
 from pptx import Presentation
 from pptx.dml.color import RGBColor
-from pptx.enum.text import MSO_ANCHOR
-from pptx.util import Inches, Pt
-from pptx.oxml.ns import qn
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+from pptx.util import Inches, Pt, Emu
 
-from common import (
-    CASE_BRIEF,
-    PAPER_JSON,
-    SLIDE_PLAN,
-    TEMPLATE_JSON,
-    WORK_DIR,
-    ChangeLog,
-    get_logger,
-    has_cjk,
-    read_json,
-    resolve_font,
-    write_json,
-)
+LOG = get_logger("build")
 
-log = get_logger("build")
-
-DARK_GRAY = RGBColor(0x59, 0x59, 0x59)
-TITLE_START, TITLE_FLOOR = 28, 18
-BODY_START, BODY_FLOOR = 18, 11
-TABLE_START, TABLE_FLOOR = 13, 9
-CAPTION_PT = 10
+DEFAULT_COLORS = {
+    "ink": "1F2A37", "primary": "173F5F", "accent": "2E86AB",
+    "accent2": "E07A5F", "soft": "F4F6F8", "rule": "D9DEE4", "muted": "6B7785",
+}
+MAX_TABLE_COLS = 9
+MAX_TABLE_ROWS = 14
 
 
-# ---------------------------------------------------------------------------
-# Font handling
-# ---------------------------------------------------------------------------
-def set_run_typefaces(run, latin: str | None = None, ea: str | None = None) -> None:
-    rPr = run._r.get_or_add_rPr()
-    for tag, name in ((qn("a:latin"), latin), (qn("a:ea"), ea), (qn("a:cs"), latin)):
-        if not name:
-            continue
-        old = rPr.find(tag)
-        if old is not None:
-            rPr.remove(old)
-        rPr.append(rPr.makeelement(tag, {"typeface": name}))
+def _rgb(hex_value: str) -> RGBColor:
+    return RGBColor.from_string((hex_value or "1F2A37").lstrip("#"))
 
 
-def font_policy(spec: dict, plan: dict) -> dict:
-    cjk = plan.get("language") == "zh"
-    theme = spec.get("theme", {})
-    if not spec.get("provided"):
-        latin = resolve_font(theme.get("minor_font") or "Calibri", cjk=False)
-        ea = resolve_font(theme.get("minor_ea_font") or "Noto Sans CJK SC", cjk=True)
-        return {"latin": latin, "ea": ea if cjk else None}
-    ea_theme = theme.get("major_ea_font") or theme.get("minor_ea_font")
-    if cjk and not ea_theme:
-        return {"latin": None, "ea": resolve_font("Noto Sans CJK SC", cjk=True)}
-    return {"latin": None, "ea": None}
+def _set_run_font(run, fonts: dict, size: int, color: RGBColor, bold: bool, cjk: bool):
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    run.font.color.rgb = color
+    family = fonts["cjk_sans"] if cjk else fonts["sans"]
+    run.font.name = family
+    # bind the east-asian font slot as well so CJK glyphs render correctly
+    try:
+        from pptx.oxml.ns import qn
+        rpr = run._r.get_or_add_rPr()
+        for tag in ("a:latin", "a:ea", "a:cs"):
+            el = rpr.find(qn(tag))
+            if el is None:
+                el = rpr.makeelement(qn(tag), {})
+                rpr.append(el)
+            el.set("typeface", family)
+    except Exception:
+        pass
 
 
-# ---------------------------------------------------------------------------
-# Deterministic text fitting
-# ---------------------------------------------------------------------------
-def _line_width_pt(text: str, pt: float) -> float:
-    cjk = sum(1 for ch in text if has_cjk(ch))
-    other = len(text) - cjk
-    return cjk * pt + other * 0.52 * pt
+def _add_text(slide, left, top, width, height, anchor=MSO_ANCHOR.TOP):
+    box = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
+    tf = box.text_frame
+    tf.word_wrap = True
+    tf.vertical_anchor = anchor
+    return tf
 
 
-def _needed_lines(text: str, box_w_pt: float, pt: float) -> int:
-    total = 0
-    for chunk in str(text).split("\n") or [""]:
-        if not chunk:
-            total += 1
-            continue
-        width = _line_width_pt(chunk, pt)
-        total += max(1, int(-(-width // box_w_pt)))
-    return total
+def _fill_paragraph(para, text, fonts, size, color, bold=False, cjk=False, level=0):
+    run = para.add_run()
+    run.text = text
+    _set_run_font(run, fonts, size, color, bold, cjk)
+    para.level = level
+    para.space_after = Pt(6)
 
 
-def fit_size(paragraphs: list[tuple[str, int]], box_w_in: float, box_h_in: float,
-             start: int, floor: int) -> tuple[int, bool]:
-    box_w = max(1.0, box_w_in) * 72
-    box_h = max(0.3, box_h_in) * 72
-    for pt in range(start, floor - 1, -1):
-        lines = 0
-        for text, level in paragraphs:
-            indent = (level or 0) * pt * 1.2
-            lines += _needed_lines(text, max(40, box_w - indent), pt)
-        if lines * pt * 1.22 <= box_h:
-            return pt, False
-    return floor, True
+def _add_rule(slide, left, top, width, color):
+    line = slide.shapes.add_connector(1, Inches(left), Inches(top), Inches(left + width), Inches(top))
+    line.line.color.rgb = color
+    line.line.width = Pt(1.5)
 
 
-# ---------------------------------------------------------------------------
-# Layout resolution
-# ---------------------------------------------------------------------------
-def _all_layouts(prs: Presentation, spec: dict):
-    info_by_name = {l["name"]: l for l in spec.get("layouts", [])}
-    out = []
-    for master in prs.slide_masters:
-        for layout in master.slide_layouts:
-            out.append((layout, info_by_name.get(layout.name, {"placeholders": [], "roles": []})))
-    return out
+def _pick_layout(prs, tpl, role):
+    layouts = tpl.get("layouts") or []
+    if not layouts:
+        return prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[0]
+    want = {"title": ["title_only", "title_content", "title_body"],
+            "divider": ["title_only", "blank"],
+            }.get(role, ["title_content", "title_body", "title_only", "custom", "blank"])
+    for tag in want:
+        for i, layout in enumerate(layouts):
+            if tag in layout.get("roles", []):
+                return prs.slide_layouts[i]
+    return prs.slide_layouts[0]
 
 
-def _wide_body(info: dict) -> float:
-    widths = [p["width"] for p in info.get("placeholders", [])
-              if p.get("width") and ("BODY" in p["type"] or "OBJECT" in p["type"])]
-    return max(widths, default=0.0)
+def _remove_empty_placeholders(slide):
+    for shape in list(slide.placeholders):
+        if not (shape.has_text_frame and shape.text_frame.text.strip()):
+            shape._element.getparent().remove(shape._element)
 
 
-def pick_layout(prs: Presentation, spec: dict, wanted: str):
-    layouts = _all_layouts(prs, spec)
-
-    def has_title(info):
-        return any("TITLE" in p["type"] for p in info.get("placeholders", []))
-
-    if wanted == "title":
-        scored = [x for x in layouts if any("SUBTITLE" in p["type"] or "CENTER_TITLE" in p["type"]
-                                            for p in x[1].get("placeholders", []))]
-        return (scored or layouts)[0][0]
-    if wanted == "section":
-        pool = [x for x in layouts if has_title(x[1]) and
-                not any("BODY" in p["type"] or "OBJECT" in p["type"]
-                        for p in x[1].get("placeholders", []))]
-        return (pool or [x for x in layouts if has_title(x[1])] or layouts)[0][0]
-    if wanted == "blank":
-        pool = [x for x in layouts if not x[1].get("placeholders")]
-        return (pool or layouts)[0][0]
-    # content / figure: title + widest body placeholder
-    candidates = sorted((x for x in layouts if has_title(x[1])),
-                        key=lambda x: _wide_body(x[1]), reverse=True)
-    return (candidates or layouts)[0][0]
-
-
-def find_placeholder(slide, type_contains: str):
-    for ph in slide.placeholders:
-        if type_contains.upper() in str(ph.placeholder_format.type).upper():
-            return ph
+def _title_placeholder(slide):
+    for shape in slide.placeholders:
+        if "title" in str(shape.placeholder_format.type).lower():
+            return shape
     return None
 
 
-def remove_shape(shape) -> None:
-    el = shape._element
-    el.getparent().remove(el)
+def _add_figure(slide, zone, paper, fig_id, colors, fonts):
+    fig = next((f for f in paper["figures"] if f["id"] == fig_id), None)
+    if not fig:
+        return f"{fig_id} not found in extraction"
+    asset = fig.get("asset") or {}
+    path = asset.get("file")
+    l, t, w, h = zone
+    if not path or not Path(path).exists():
+        rect = slide.shapes.add_shape(1, Inches(l), Inches(t), Inches(w), Inches(h))
+        rect.fill.solid(); rect.fill.fore_color.rgb = _rgb(colors["soft"])
+        rect.line.color.rgb = _rgb(colors["rule"])
+        tf = rect.text_frame; tf.text = f"[ {fig_id} asset unavailable ]"
+        return f"{fig_id} asset missing; placeholder rendered"
+    from PIL import Image
+    with Image.open(path) as im:
+        iw, ih = im.size
+    scale = min(w / (iw / 96.0), h / (ih / 96.0))
+    pw, ph = (iw / 96.0) * scale, (ih / 96.0) * scale
+    slide.shapes.add_picture(path, Inches(l + (w - pw) / 2), Inches(t + (h - ph) / 2),
+                             width=Inches(pw), height=Inches(ph))
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Content writers
-# ---------------------------------------------------------------------------
-_ACTIVE_POLICY: dict = {}
+def _normalize_rows(rows):
+    clean = []
+    for row in rows:
+        cells = [(c or "").strip() for c in row]
+        if len(cells) > MAX_TABLE_COLS:
+            cells = cells[:MAX_TABLE_COLS - 1] + [" ".join(cells[MAX_TABLE_COLS - 1:])]
+        clean.append(cells)
+    width = max((len(r) for r in clean), default=1)
+    clean = [r + [""] * (width - len(r)) for r in clean][:MAX_TABLE_ROWS]
+    return _tidy_columns(clean)
 
 
-def apply_font(run, policy: dict | None = None) -> None:
-    pol = policy or _ACTIVE_POLICY
-    set_run_typefaces(run, latin=pol.get("latin"), ea=pol.get("ea"))
+def _tidy_columns(rows):
+    """Merge a column that is empty in every data row into its left neighbor,
+    joining header words (fixes split headers such as 'Maximum Path'/'Length')."""
+    if len(rows) < 2:
+        return rows, max((len(r) for r in rows), default=1)
+    ncols = max(len(r) for r in rows)
+    rows = [r + [""] * (ncols - len(r)) for r in rows]
+    data = rows[1:]
+    c = 0
+    while c < ncols:
+        col_empty = all(not (r[c] or "").strip() for r in data)
+        if col_empty and c > 0:
+            for r in rows:
+                if r[c].strip():
+                    r[c - 1] = (r[c - 1] + " " + r[c]).strip()
+            for r in rows:
+                r.pop(c)
+            ncols -= 1
+            continue
+        c += 1
+    return rows, ncols
 
 
-def fill_title(ph, text: str, box: tuple) -> list[str]:
-    pt, overflow = fit_size([(text, 0)], box[2], box[3], TITLE_START, TITLE_FLOOR)
-    tf = ph.text_frame
-    tf.word_wrap = True
-    tf.auto_size = None
-    run = tf.paragraphs[0].add_run()
-    run.text = str(text)
-    run.font.size = Pt(pt)
-    run.font.bold = True
-    apply_font(run)
-    return [f"title at floor {pt}pt still overflow"] if overflow else []
-
-
-def fill_bullets(ph, bullets: list[dict], box: tuple,
-                 anchor: MSO_ANCHOR = MSO_ANCHOR.TOP) -> tuple[int, list[str]]:
-    tf = ph.text_frame
-    tf.word_wrap = True
-    tf.auto_size = None
-    tf.vertical_anchor = anchor
-    paras = [(b.get("text", ""), b.get("level", 0)) for b in bullets]
-    pt, overflow = fit_size(paras, box[2], box[3], BODY_START, BODY_FLOOR)
-    for i, b in enumerate(bullets):
-        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        p.level = int(b.get("level", 0))
-        p.space_after = Pt(6)
-        run = p.add_run()
-        run.text = b.get("text", "")
-        run.font.size = Pt(pt)
-        apply_font(run)
-    return pt, [f"bullets at floor {pt}pt still overflow"] if overflow else []
-
-
-def add_textbox(slide, left, top, width, height):
-    return slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
-
-
-def contain_size(img_w: int, img_h: int, rect: tuple[float, float, float, float]) -> tuple:
-    rl, rt, rw, rh = rect
-    scale = min(rw / img_w, rh / img_h)
-    w, h = img_w * scale, img_h * scale
-    return rl + (rw - w) / 2, rt + (rh - h) / 2, w, h
-
-
-def place_picture(slide, asset: str, rect: tuple) -> tuple:
-    with Image.open(asset) as im:
-        w_px, h_px = im.size
-    l, t, w, h = contain_size(w_px, h_px, rect)
-    return slide.shapes.add_picture(asset, Inches(l), Inches(t), Inches(w), Inches(h))
-
-
-def _caption_height(caption: str, width_in: float, pt: int = CAPTION_PT) -> float:
-    if not caption:
-        return 0.0
-    cjk = sum(1 for ch in caption if has_cjk(ch))
-    text_w = cjk * pt + (len(caption) - cjk) * 0.52 * pt
-    box_w = max(1.0, width_in) * 72
-    lines = max(1, int(-(-text_w // box_w)), caption.count("\n") + 1)
-    return min(1.15, lines * pt * 1.25 / 72 + 0.05)
-
-
-def add_caption(slide, left: float, top: float, width: float,
-                caption: str, height: float = 0.5, pt: int = CAPTION_PT) -> None:
-    if not caption:
-        return
-    box = add_textbox(slide, left, top, width, height)
-    tf = box.text_frame
-    tf.word_wrap = True
-    run = tf.paragraphs[0].add_run()
-    run.text = caption[:380]
-    run.font.size = Pt(pt)
-    run.font.color.rgb = DARK_GRAY
-    apply_font(run)
-
-
-def add_source_label(slide, safe: dict, text: str) -> None:
-    if not text:
-        return
-    box = add_textbox(slide, safe["left"], safe["bottom"] - 0.28, safe["width"], 0.26)
-    tf = box.text_frame
-    tf.word_wrap = True
-    run = tf.paragraphs[0].add_run()
-    run.text = text
-    run.font.size = Pt(9)
-    run.font.color.rgb = DARK_GRAY
-    apply_font(run)
-
-
-# ---------------------------------------------------------------------------
-# Native table
-# ---------------------------------------------------------------------------
-def place_native_table(slide, paper_table: dict, region: dict) -> list[str]:
-    rows = paper_table["rows"]
-    max_rows = max(1, int((region["height"] - 0.2) / 0.32))
-    truncated = False
-    if len(rows) > max_rows:
-        rows = rows[:max_rows]
-        truncated = True
-    cols = max(len(r) for r in rows)
-    rows = [r + [""] * (cols - len(r)) for r in rows]
-    h = min(region["height"], 0.32 * len(rows) + 0.1)
-    gframe = slide.shapes.add_table(len(rows), cols, Inches(region["left"]),
-                                    Inches(region["top"]), Inches(region["width"]), Inches(h))
-    table = gframe.table
-    pt = TABLE_START if len(rows) <= 12 else TABLE_FLOOR + 1
+def _add_table(slide, zone, paper, tab_id, colors, fonts, cjk):
+    tab = next((t for t in paper["tables"] if t["id"] == tab_id), None)
+    if not tab:
+        return f"{tab_id} not found"
+    rows, ncols = _normalize_rows(tab.get("rows", []))
+    if not rows:
+        return f"{tab_id} has no extracted rows"
+    l, t, w, h = zone
+    nrows = len(rows)
+    gfx = slide.shapes.add_table(nrows, ncols, Inches(l), Inches(t), Inches(w), Inches(h))
+    table = gfx.table
+    font_size = 11 if ncols <= 5 else (9.5 if ncols <= 7 else 8.5)
+    # compact, explicit row heights so rows do not stretch across the zone
+    row_h = Pt(26 if nrows <= 8 else 20)
+    for r in range(nrows):
+        table.rows[r].height = row_h
     for r, row in enumerate(rows):
         for c, value in enumerate(row):
             cell = table.cell(r, c)
             cell.margin_left = Inches(0.05); cell.margin_right = Inches(0.05)
             cell.margin_top = Inches(0.02); cell.margin_bottom = Inches(0.02)
-            cell.vertical_anchor = MSO_ANCHOR.MIDDLE
-            run = cell.text_frame.paragraphs[0].add_run()
-            run.text = str(value)
-            run.font.size = Pt(pt)
-            if r == 0:
-                run.font.bold = True
-            apply_font(run)
-    return [f"table {paper_table['id']} truncated to {max_rows} rows"] if truncated else []
+            cell.fill.solid()
+            cell.fill.fore_color.rgb = _rgb(colors["soft"]) if r == 0 else RGBColor(0xFF, 0xFF, 0xFF)
+            tf = cell.text_frame; tf.word_wrap = True
+            para = tf.paragraphs[0]
+            _fill_paragraph(para, value[:120], fonts, font_size,
+                            _rgb(colors["ink"]), bold=(r == 0), cjk=cjk)
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Per-slide building
-# ---------------------------------------------------------------------------
-def _ph_box(ph, safe: dict) -> tuple:
-    l = ph.left / 914400 if ph.left is not None else safe["left"]
-    t = ph.top / 914400 if ph.top is not None else safe["top"]
-    w = ph.width / 914400 if ph.width is not None else safe["width"]
-    h = ph.height / 914400 if ph.height is not None else safe["height"]
-    return l, t, w, h
+def _title_lines(title: str, width_in: float) -> int:
+    """Estimate wrapped line count for a 26pt bold title in the given width."""
+    import math
+    # 26pt bold average glyph advance ~0.52em; width available in points
+    chars_per_line = max(12, int((width_in * 72) / (26 * 0.55)))
+    return min(3, max(1, math.ceil(len(title) / chars_per_line)))
 
 
-def _content_region(safe: dict, title_ph) -> dict:
-    if title_ph is not None:
-        tb = _ph_box(title_ph, safe)
-        top = tb[1] + tb[3] + 0.15
-    else:
-        top = safe["top"] + 0.75
-    return {"left": safe["left"], "top": top,
-            "width": safe["width"],
-            "height": safe["bottom"] - top - 0.32,
-            "right": safe["right"], "bottom": safe["bottom"] - 0.32}
+def build(brief, paper, tpl, plan, output_dir: Path) -> dict:
+    colors = tpl.get("colors") or DEFAULT_COLORS
+    colors = {**DEFAULT_COLORS, **colors}
+    fonts = tpl.get("fonts") or {"sans": "Liberation Sans", "cjk_sans": "Noto Sans CJK SC"}
+    cjk = plan.get("language") == "zh"
+    safe = tpl.get("safe_area", {"left": 0.62, "top": 0.52, "right": 12.72, "bottom": 6.92})
 
+    source_deck = None
+    for key in ("starting_decks", "templates"):
+        if brief.get("roles", {}).get(key):
+            source_deck = brief["roles"][key][0]
+            break
 
-def build_slide(prs: Presentation, spec: dict, plan_slide: dict, paper: dict) -> list[str]:
-    safe = spec["safe_area"]
-    warnings: list[str] = []
-    wanted = "title" if plan_slide["role"] == "title" else \
-             "section" if plan_slide["role"] == "section" else \
-             "blank" if plan_slide["role"] == "backup" else "content"
-    layout = pick_layout(prs, spec, wanted)
-    slide = prs.slides.add_slide(layout)
-    title_ph = find_placeholder(slide, "TITLE")
-    sub_ph = find_placeholder(slide, "SUBTITLE")
-
-    # ---- title slide ----
-    if plan_slide["role"] == "title":
-        if title_ph:
-            warnings += fill_title(title_ph, plan_slide["title"], _ph_box(title_ph, safe))
-        sub_text = " ".join(b.get("text", "") for b in plan_slide.get("bullets", []))
-        if sub_ph and sub_text:
-            run = sub_ph.text_frame.paragraphs[0].add_run()
-            run.text = sub_text
-            run.font.size = Pt(16)
-            apply_font(run)
-        for ph in list(slide.placeholders):
-            t = str(ph.placeholder_format.type)
-            if "BODY" in t or "OBJECT" in t or "PICTURE" in t:
-                remove_shape(ph)
-        return warnings
-
-    # ---- standard slides: keep the real title placeholder, drop body ones ----
-    if title_ph:
-        warnings += fill_title(title_ph, plan_slide["title"], _ph_box(title_ph, safe))
-    else:
-        # no title placeholder: manual box with the same adaptive sizing
-        title_h = 1.05
-        box = add_textbox(slide, safe["left"], safe["top"], safe["width"], title_h)
-        warnings += fill_title(box, plan_slide["title"],
-                               (safe["left"], safe["top"], safe["width"], title_h))
-    for ph in list(slide.placeholders):
-        t = str(ph.placeholder_format.type)
-        if "BODY" in t or "OBJECT" in t or "PICTURE" in t:
-            remove_shape(ph)
-
-    region = _content_region(safe, title_ph)
-    figures = plan_slide.get("figures", [])
-    table_refs = plan_slide.get("tables", [])
-    bullets = plan_slide.get("bullets", [])
-
-    # ---- native table ----
-    if table_refs and not figures:
-        tbl_index = {t["id"]: t for t in paper.get("tables", [])}
-        t = tbl_index.get(str(table_refs[0]["id"]))
-        if t and t.get("rows"):
-            warnings += place_native_table(slide, t, region)
-        add_source_label(slide, safe, plan_slide.get("source_label", ""))
-        return warnings
-
-    # ---- figures ----
-    if figures:
-        if len(figures) == 1:
-            cap_text = figures[0].get("caption_verbatim", "")
-            cap_pt = CAPTION_PT
-            cap_h = _caption_height(cap_text, region["width"], cap_pt)
-            if cap_h > 0.9:
-                cap_pt = 9
-                cap_h = _caption_height(cap_text, region["width"], 9)
-            upper_h = max(1.2, region["height"] - cap_h - 0.08)
-            if bullets:
-                fig_w = region["width"] * 0.58
-                fig_rect = (region["left"], region["top"], fig_w, upper_h)
-                b_rect = (region["left"] + fig_w + 0.3, region["top"],
-                          region["width"] - fig_w - 0.3, upper_h)
-                box = add_textbox(slide, *b_rect)
-                _, bw = fill_bullets(box, bullets, b_rect)
-                warnings += bw
-            else:
-                fig_rect = (region["left"], region["top"], region["width"], upper_h)
-            place_picture(slide, figures[0]["asset_path"], fig_rect)
-            add_caption(slide, region["left"], region["top"] + upper_h + 0.06,
-                        region["width"], cap_text, height=cap_h, pt=cap_pt)
-        else:
-            col_w = (region["width"] - 0.25) / 2
-            for i, ref in enumerate(figures[:4]):
-                col, row = i % 2, i // 2
-                cell = (region["left"] + col * (col_w + 0.25),
-                        region["top"] + row * (region["height"] / 2),
-                        col_w, region["height"] / 2 - 0.42)
-                place_picture(slide, ref["asset_path"], cell)
-                add_caption(slide, cell[0], cell[1] + cell[3] + 0.02, col_w,
-                            ref.get("caption_verbatim", "")[:180], height=0.4)
-        add_source_label(slide, safe, plan_slide.get("source_label", ""))
-        return warnings
-
-    # ---- pure text ----
-    box = add_textbox(slide, region["left"], region["top"], region["width"], region["height"])
-    _, bw = fill_bullets(box, bullets,
-                         (region["left"], region["top"], region["width"], region["height"]))
-    warnings += bw
-    add_source_label(slide, safe, plan_slide.get("source_label", ""))
-    return warnings
-
-
-def set_notes(slide, text: str) -> None:
-    if text:
-        slide.notes_slide.notes_text_frame.text = str(text)
-
-
-def build(work_dir: Path) -> dict:
-    global _ACTIVE_POLICY
-    brief = read_json(work_dir / CASE_BRIEF)
-    paper = read_json(work_dir / PAPER_JSON)
-    spec = read_json(work_dir / TEMPLATE_JSON)
-    plan = read_json(work_dir / SLIDE_PLAN)
-    changes = ChangeLog(work_dir)
-
-    source = brief.get("starting_pptx") or brief.get("template_pptx")
-    if source:
-        prs = Presentation(source)
-        existing = list(prs.slides._sldIdLst)
-        for sld_id in existing:
-            rId = sld_id.get(qn("r:id"))
-            prs.slides._sldIdLst.remove(sld_id)
-            if rId:
-                prs.part.drop_rel(rId)
-        if existing:
-            changes.add("build", "reset", f"removed {len(existing)} example slides from source deck")
+    if source_deck and Path(source_deck).exists():
+        prs = Presentation(source_deck)
+        # drop existing slides but keep the master/layouts/theme
+        sldIdLst = prs.slides._sldIdLst
+        for sldId in list(sldIdLst):
+            prs.part.drop_rel(sldId.rId)
+            sldIdLst.remove(sldId)
+        theme_mode = "provided"
     else:
         prs = Presentation()
-        prs.slide_width = Inches(13.333)
-        prs.slide_height = Inches(7.5)
+        prs.slide_width = Inches(tpl.get("slide_w_in", 13.333))
+        prs.slide_height = Inches(tpl.get("slide_h_in", 7.5))
+        theme_mode = "scholar-default"
 
-    _ACTIVE_POLICY = font_policy(spec, plan)
-    all_warnings: list[str] = []
-    for plan_slide in plan["slides"]:
-        warns = build_slide(prs, spec, plan_slide, paper)
-        set_notes(prs.slides[-1], plan_slide.get("notes", ""))
-        all_warnings.extend(f"slide {plan_slide['slide_no']}: {w}" for w in warns)
+    findings = []
+    for spec in plan["slides"]:
+        role = spec["role"]
+        layout = _pick_layout(prs, tpl, role)
+        slide = prs.slides.add_slide(layout)
+        title_ph = _title_placeholder(slide)
+        # Guard against divider-style layouts whose title sits in the lower
+        # half of the slide: drop it and use a correctly positioned manual title.
+        if title_ph is not None and title_ph.top is not None:
+            top_in = title_ph.top / 914400
+            if top_in > tpl.get("slide_h_in", 7.5) * 0.5:
+                title_ph._element.getparent().remove(title_ph._element)
+                title_ph = None
+        if title_ph is not None:
+            title_ph.text = spec["title"]
+            for para in title_ph.text_frame.paragraphs:
+                for run in para.runs:
+                    _set_run_font(run, fonts, 26, _rgb(colors["primary"]), True, cjk)
+        _remove_empty_placeholders(slide)
 
-    out_path = work_dir / "academic_deck.pptx"
-    prs.save(str(out_path))
-    report = {"deck": str(out_path), "slides": len(plan["slides"]),
-              "font_policy": _ACTIVE_POLICY, "warnings": all_warnings}
-    write_json(work_dir / "build_report.json", report)
-    changes.add("build", "save", f"{out_path.name} with {len(plan['slides'])} slides")
-    log.info("saved %s (%d slides), warnings=%d", out_path, len(plan["slides"]), len(all_warnings))
+        s_l, s_t, s_r, s_b = safe["left"], safe["top"], safe["right"], safe["bottom"]
+        s_w = s_r - s_l
+        title_lines = _title_lines(spec["title"], s_w)
+        title_h = 0.42 * title_lines
+        if title_ph is None:
+            # manual claim title
+            tf = _add_text(slide, s_l, s_t, s_w, title_h + 0.15)
+            para = tf.paragraphs[0]
+            _fill_paragraph(para, spec["title"], fonts, 26, _rgb(colors["primary"]), bold=True, cjk=cjk)
+            _add_rule(slide, s_l, s_t + title_h + 0.12, s_w, _rgb(colors["primary"]))
+            content_top = s_t + title_h + 0.28
+        else:
+            content_top = s_t + title_h + 0.45
+
+        has_evidence = bool(spec["figures"] or spec["tables"])
+        if has_evidence:
+            text_w = 4.6
+            zone_left = s_l + text_w + 0.35
+            zone = (zone_left, content_top, s_r - zone_left, s_b - content_top - 0.25)
+        else:
+            text_w = s_w
+        tf = _add_text(slide, s_l, content_top, text_w, s_b - content_top - 0.2)
+        first = True
+        for bullet in spec["bullets"]:
+            para = tf.paragraphs[0] if first else tf.add_paragraph()
+            first = False
+            _fill_paragraph(para, ("• " if bullet.get("level", 0) == 0 else "– ") + bullet["text"],
+                            fonts, 15 if bullet.get("level", 0) == 0 else 13,
+                            _rgb(colors["ink"]), cjk=cjk, level=bullet.get("level", 0))
+
+        for fig_id in spec["figures"]:
+            issue = _add_figure(slide, zone, paper, fig_id, colors, fonts)
+            if issue:
+                findings.append(issue)
+        for tab_id in spec["tables"]:
+            issue = _add_table(slide, zone, paper, tab_id, colors, fonts, cjk)
+            if issue:
+                findings.append(issue)
+
+        if spec.get("source_label"):
+            lab = _add_text(slide, s_l, s_b - 0.02, s_w, 0.3)
+            _fill_paragraph(lab.paragraphs[0], spec["source_label"], fonts, 10,
+                            _rgb(colors["muted"]), cjk=cjk)
+        if spec.get("backup"):
+            tag = _add_text(slide, s_r - 1.2, s_t - 0.05, 1.2, 0.3)
+            p = tag.paragraphs[0]; p.alignment = PP_ALIGN.RIGHT
+            _fill_paragraph(p, "BACKUP", fonts, 10, _rgb(colors["muted"]), bold=True, cjk=cjk)
+
+        notes = spec.get("notes", "")
+        slide.notes_slide.notes_text_frame.text = notes
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    deck_path = output_dir / "deck.pptx"
+    prs.save(str(deck_path))
+    report = {
+        "deck": str(deck_path), "slides": len(plan["slides"]),
+        "theme_mode": theme_mode, "source_deck": source_deck,
+        "findings": findings,
+    }
+    write_json(output_dir / BUILD_REPORT, report)
     return report
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--work-dir", default=str(WORK_DIR))
-    args = ap.parse_args()
-    build(Path(args.work_dir))
+def run(work_dir=None, output_dir=None):
+    work_dir = Path(work_dir)
+    output_dir = Path(output_dir or OUTPUT_DIR)
+    brief = read_json(work_dir / CASE_BRIEF)
+    paper = read_json(work_dir / PAPER_JSON)
+    tpl = read_json(work_dir / TEMPLATE_JSON)
+    plan = read_json(work_dir / SLIDE_PLAN)
+    report = build(brief, paper, tpl, plan, output_dir)
+    ChangeLog(work_dir).add("build", "deck built", f"{report['slides']} slides, {report['theme_mode']}")
+    LOG.info("built %s (%d slides)", report["deck"], report["slides"])
+    return report
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    from common import WORK_DIR
+    args = sys.argv[1:]
+    run(Path(args[0]) if args else WORK_DIR,
+        Path(args[1]) if len(args) > 1 else OUTPUT_DIR)

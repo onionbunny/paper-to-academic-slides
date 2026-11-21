@@ -1,221 +1,197 @@
-"""Stage 1 — case intake.
+"""Stage 1 — intake.
 
-Reads /input/case.json and /input/task.md, enumerates every supplied material,
-classifies files (paper / template / starting deck / other) and extracts the
-organizer-frozen constraints (audience, time budget, slide cap, language).
+Reads case.json / task.md, inventories every supplied file, assigns roles
+(paper, template, starting deck, supplementary doc, image, data) and freezes
+the hard constraints (audience, minutes, slide cap, language). No model
+reasoning happens here; everything is deterministic and auditable.
 """
 from __future__ import annotations
 
 import argparse
-import re
 from pathlib import Path
 
 from common import (
-    CASE_BRIEF,
-    WORK_DIR,
-    ensure_dir,
-    get_logger,
-    read_json,
-    read_text,
-    write_json,
-    ChangeLog,
+    CASE_BRIEF, INPUT_DIR, WORK_DIR, ChangeLog, ensure_dir,
+    get_logger, read_json, read_text, write_json,
 )
 
 log = get_logger("intake")
 
 PAPER_EXT = {".pdf"}
 DECK_EXT = {".pptx", ".ppt"}
-DOC_EXT = {".docx", ".doc"}
-IMG_EXT = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".gif", ".bmp"}
+DOC_EXT = {".docx", ".doc", ".txt", ".md", ".rtf"}
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".gif", ".bmp"}
+DATA_EXT = {".csv", ".xlsx", ".xls", ".json", ".tsv"}
 
-TEMPLATE_HINTS = ("template", "master", "theme", "模板", "母版", "版式")
-START_HINTS = ("start", "base", "seed", "starter", "initial", "底稿", "起始", "初始")
+TEMPLATE_KEY_HINTS = ("template", "master", "theme", "母版", "模板")
+START_DECK_KEY_HINTS = ("starting", "starter", "base_deck", "deck", "slides", "起始", "初始")
+TEMPLATE_NAME_HINTS = ("template", "master", "theme", "blank", "母版", "模板")
 
 
-def _walk_files(root: Path) -> list[Path]:
-    files: list[Path] = []
-    for p in root.rglob("*"):
-        if p.is_file():
-            files.append(p)
-    return sorted(files, key=lambda x: str(x).lower())
+def _resolve(path_value: str, input_dir: Path) -> Path:
+    p = Path(path_value)
+    if not p.is_absolute():
+        p = input_dir / p
+    return p
 
 
 def _classify(path: Path) -> str:
     ext = path.suffix.lower()
     if ext in PAPER_EXT:
-        return "paper_pdf"
+        return "paper"
     if ext in DECK_EXT:
-        return "deck_pptx"
+        return "deck"
     if ext in DOC_EXT:
-        return "document"
-    if ext in IMG_EXT:
+        return "doc"
+    if ext in IMAGE_EXT:
         return "image"
+    if ext in DATA_EXT:
+        return "data"
     return "other"
 
 
-def _flat_values(obj, prefix=""):
-    """Yield (dotted_key, value) leaves of arbitrary nested JSON."""
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            yield from _flat_values(v, f"{prefix}.{k}" if prefix else str(k))
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            yield from _flat_values(v, f"{prefix}[{i}]")
-    else:
-        yield prefix, obj
+def _deck_role(key: str, name: str, has_slides: bool) -> str:
+    hay = f"{key} {name}".lower()
+    if any(h in hay for h in TEMPLATE_KEY_HINTS):
+        return "template"
+    if any(h in hay for h in START_DECK_KEY_HINTS):
+        return "starting_deck"
+    if any(h in name.lower() for h in TEMPLATE_NAME_HINTS):
+        return "template"
+    # A deck that already contains real slides is a starting deck; an empty
+    # deck (only master/layouts) is treated as a template.
+    return "starting_deck" if has_slides else "template"
 
 
-def _extract_constraints(case: dict, task_md: str) -> dict:
-    constraints = {
-        "max_slides": None,
-        "minutes": None,
-        "audience": None,
-        "language": None,
-        "title": None,
-        "output_contract": None,
-    }
-    key_patterns = {
-        "max_slides": re.compile(r"(slide|page|页|幻灯)", re.I),
-        "minutes": re.compile(r"(time|minute|duration|时长|分钟|时间)", re.I),
-        "audience": re.compile(r"(audience|受众|听众|观众)", re.I),
-        "language": re.compile(r"(lang|language|语言)", re.I),
-        "title": re.compile(r"(title|名称|标题)", re.I),
-    }
-    for key, value in _flat_values(case):
-        last = key.split(".")[-1].rstrip("0123456789[]")
-        for field, pat in key_patterns.items():
-            if pat.search(key) and value not in (None, ""):
-                if field in ("max_slides", "minutes"):
-                    m = re.search(r"\d+", str(value))
-                    num = int(m.group()) if m else None
-                    if num and (constraints[field] is None or num < constraints[field]):
-                        constraints[field] = num
-                elif constraints[field] is None:
-                    constraints[field] = str(value)
-        if "output_contract" in key.lower() or "contract" in key.lower():
-            constraints["output_contract"] = constraints["output_contract"] or value
-    # task.md fallback patterns
-    if constraints["max_slides"] is None:
-        m = re.search(r"(\d{1,2})\s*(?:slides?|pages?|页|张幻灯)", task_md, re.I)
-        if m:
-            constraints["max_slides"] = int(m.group(1))
-    if constraints["minutes"] is None:
-        m = re.search(r"(\d{1,2})\s*(?:minutes?|mins?|分钟|分钟汇报|分钟报告)", task_md, re.I)
-        if m:
-            constraints["minutes"] = int(m.group(1))
-    m = re.search(r"受众[:：]\s*([^\n；;]+)", task_md)
-    if m and not constraints["audience"]:
-        constraints["audience"] = m.group(1).strip()
-    # case-provided PDF password (never guessed or brute-forced)
-    pw = case.get("pdf_password") or case.get("password")
-    if not pw and isinstance(case.get("materials"), dict):
-        pw = case["materials"].get("password")
-    if pw:
-        constraints["pdf_password"] = str(pw)
-    return constraints
+def _deck_has_slides(path: Path) -> bool:
+    if path.suffix.lower() != ".pptx":
+        return False
+    try:
+        from pptx import Presentation
+        return len(Presentation(str(path)).slides) > 0
+    except Exception as exc:
+        log.warning("cannot open deck %s: %s", path.name, exc)
+        return False
 
 
-def _resolve_case_id(case: dict, input_dir: Path) -> str:
-    for key in ("case_id", "id", "caseId", "case"):
-        if isinstance(case, dict) and case.get(key):
-            return str(case[key])
-    return input_dir.name or "unknown_case"
+def _backup_reserve(cap: int) -> int:
+    if cap >= 14:
+        return 2
+    if cap >= 10:
+        return 1
+    return 0
 
 
-def run(input_dir: Path, work_dir: Path) -> dict:
+def run(input_dir: Path | None = None, work_dir: Path | None = None) -> dict:
+    input_dir = Path(input_dir or INPUT_DIR)
+    work_dir = Path(work_dir or WORK_DIR)
     ensure_dir(work_dir)
     changes = ChangeLog(work_dir)
-    warnings: list[str] = []
 
     case_path = input_dir / "case.json"
     task_path = input_dir / "task.md"
-    case = read_json(case_path, default={}) if case_path.exists() else {}
     if not case_path.exists():
-        warnings.append("case.json not found; constraints inferred from files and task.md")
-    task_md = read_text(task_path) if task_path.exists() else ""
-    if not task_path.exists():
-        warnings.append("task.md not found")
+        raise FileNotFoundError(f"missing required input: {case_path}")
+    case = read_json(case_path)
+    task = read_text(task_path) if task_path.exists() else ""
 
-    files = _walk_files(input_dir)
-    file_records = []
-    for f in files:
-        if f.name in ("case.json", "task.md"):
-            continue
-        kind = _classify(f)
-        lower = f.name.lower()
-        role_hint = None
-        if kind == "deck_pptx":
-            if any(h in lower for h in TEMPLATE_HINTS) or any(h in f.name for h in TEMPLATE_HINTS):
-                role_hint = "template"
-            elif any(h in lower for h in START_HINTS) or any(h in f.name for h in START_HINTS):
-                role_hint = "starting_deck"
-        file_records.append(
-            {
-                "path": str(f.resolve()),
-                "rel": str(f.relative_to(input_dir)),
-                "name": f.name,
-                "ext": f.suffix.lower(),
-                "size": f.stat().st_size,
-                "kind": kind,
-                "role_hint": role_hint,
-            }
-        )
+    materials = case.get("materials", {}) or {}
+    declared: list[tuple[str, Path]] = []
+    if isinstance(materials, dict):
+        for key, value in materials.items():
+            if isinstance(value, str):
+                declared.append((key, _resolve(value, input_dir)))
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str):
+                        declared.append((key, _resolve(item, input_dir)))
 
-    paper_pdfs = [r["path"] for r in file_records if r["kind"] == "paper_pdf"]
-    decks = [r for r in file_records if r["kind"] == "deck_pptx"]
-    template_deck = None
-    starting_deck = None
-    hinted_template = [r for r in decks if r["role_hint"] == "template"]
-    hinted_start = [r for r in decks if r["role_hint"] == "starting_deck"]
-    if hinted_template:
-        template_deck = hinted_template[0]["path"]
-    if hinted_start:
-        starting_deck = hinted_start[0]["path"]
-    if not template_deck and not starting_deck and decks:
-        # single unlabeled deck: treat as the editable template by default
-        template_deck = decks[0]["path"]
-    elif len(decks) == 1 and not template_deck and starting_deck:
-        template_deck = starting_deck
-    if len(paper_pdfs) > 1:
-        warnings.append("multiple PDFs found; the largest is treated as the primary paper")
-        paper_pdfs = sorted(paper_pdfs, key=lambda p: Path(p).stat().st_size, reverse=True)
+    declared_set = {p.resolve() for _, p in declared if p.exists()}
+    inventory: list[dict] = []
+    seen: set[Path] = set()
 
-    constraints = _extract_constraints(case if isinstance(case, dict) else {}, task_md)
-    if constraints["max_slides"] is None and constraints["minutes"]:
-        # common academic convention: ~1 slide per minute plus title
-        constraints["max_slides"] = constraints["minutes"] + 1
-        warnings.append("max_slides derived from time budget (1 slide/minute + title)")
+    def register(key: str, path: Path, explicit: bool) -> None:
+        if not path.exists() or path.resolve() in seen:
+            return
+        seen.add(path.resolve())
+        kind = _classify(path)
+        role = kind
+        if kind == "deck":
+            role = _deck_role(key, path.name, _deck_has_slides(path))
+        size = path.stat().st_size
+        inventory.append({
+            "key": key or None,
+            "file": str(path),
+            "name": path.name,
+            "extension": path.suffix.lower(),
+            "kind": kind,
+            "role": role,
+            "explicit": explicit,
+            "size_bytes": size,
+            "exists": True,
+        })
+        changes.add("intake", "inventory", f"{role}: {path.name} ({size} bytes)")
 
-    case_id = _resolve_case_id(case if isinstance(case, dict) else {}, input_dir)
+    for key, path in declared:
+        register(key, path, explicit=True)
+    # pick up any undeclared files sitting in the input directory
+    for path in sorted(input_dir.rglob("*")):
+        if path.is_file() and path.name not in {"case.json", "task.md"}:
+            if path.resolve() not in declared_set:
+                register("", path, explicit=False)
+
+    missing = [str(p) for _, p in declared if not p.exists()]
+    for m in missing:
+        log.warning("declared material does not exist: %s", m)
+
+    papers = [x for x in inventory if x["role"] == "paper"]
+    if not papers:
+        # a PDF may have been classified generically; still flag honestly
+        log.warning("no paper PDF found in input")
+
+    cap = int(case.get("max_slides", 15))
+    minutes = case.get("time_minutes")
+    minutes = float(minutes) if minutes is not None else float(cap)
+    audience = case.get("audience", "a general academic audience")
+    language = case.get("language")  # may be unknown until extraction
+
     brief = {
-        "case_id": case_id,
-        "input_dir": str(input_dir.resolve()),
-        "files": file_records,
-        "paper_pdfs": paper_pdfs,
-        "primary_paper": paper_pdfs[0] if paper_pdfs else None,
-        "template_pptx": template_deck,
-        "starting_pptx": starting_deck,
-        "constraints": constraints,
-        "raw_case": case,
-        "task_md": task_md,
-        "warnings": warnings,
+        "case_id": case.get("case_id", "unknown-case"),
+        "task": task.strip(),
+        "audience": audience,
+        "time_minutes": minutes,
+        "max_slides": cap,
+        "language_hint": language,
+        "output_contract": case.get("output_contract"),
+        "pacing": {
+            "target_seconds_per_slide": round(minutes * 60 / max(1, cap), 1),
+            "suggested_backup_reserve": _backup_reserve(cap),
+            "talk_slide_target": cap - _backup_reserve(cap),
+        },
+        "inventory": inventory,
+        "missing_materials": missing,
+        "roles": {
+            "papers": [x["file"] for x in inventory if x["role"] == "paper"],
+            "templates": [x["file"] for x in inventory if x["role"] == "template"],
+            "starting_decks": [x["file"] for x in inventory if x["role"] == "starting_deck"],
+            "docs": [x["file"] for x in inventory if x["role"] == "doc"],
+            "images": [x["file"] for x in inventory if x["role"] == "image"],
+            "data": [x["file"] for x in inventory if x["role"] == "data"],
+        },
     }
-    write_json(work_dir / CASE_BRIEF, brief)
-    changes.add("intake", "write", f"case brief with {len(file_records)} material files")
-    log.info("case_id=%s papers=%d template=%s start=%s warnings=%d",
-             case_id, len(paper_pdfs), bool(template_deck), bool(starting_deck), len(warnings))
-    return brief
+    out = write_json(work_dir / CASE_BRIEF, brief)
+    log.info("case %s: %d files, cap %d slides, %.0f min, audience=%s",
+             brief["case_id"], len(inventory), cap, minutes, audience)
+    return {"brief": str(out)}
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input-dir", default=str(INPUT_DIR_DEFAULT))
-    ap.add_argument("--work-dir", default=str(WORK_DIR))
-    args = ap.parse_args()
-    run(Path(args.input_dir), Path(args.work_dir))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input-dir")
+    parser.add_argument("--work-dir")
+    args = parser.parse_args()
+    run(args.input_dir, args.work_dir)
 
-
-INPUT_DIR_DEFAULT = Path(__import__("common").INPUT_DIR)
 
 if __name__ == "__main__":
     main()

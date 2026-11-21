@@ -1,253 +1,180 @@
-"""Stage 7 — assemble /app/output and write result.json.
-
-Copies every reviewer-facing artifact (editable PPTX, rendered PDF, PNG
-previews, page-level evidence map, plan and QA report) and writes the result
-contract with honest status, sources, uncertainty, warnings/errors, change
-records and the full environment/version fingerprint.
-"""
+"""Finalize the run: evidence ledger, notes file and result.json."""
 from __future__ import annotations
 
-import argparse
-import platform
-import sys
+import hashlib
+import time
 from pathlib import Path
 
 from common import (
-    CASE_BRIEF,
-    CHANGE_LOG,
-    OUTPUT_DIR,
-    PAPER_JSON,
-    QA_REPORT,
-    RENDER_JSON,
-    RESULT_JSON,
-    SLIDE_PLAN,
-    TEMPLATE_JSON,
-    WORK_DIR,
-    ChangeLog,
-    copy_file,
-    ensure_dir,
-    get_logger,
-    read_json,
-    write_json,
+    CHANGE_RECORDS, QA_REPORT, CASE_BRIEF, PAPER_JSON, RENDER_JSON, SLIDE_PLAN,
+    TEMPLATE_JSON, get_logger, read_json, write_json,
 )
 
-log = get_logger("finalize")
+LOG = get_logger("finalize")
+SKILL_NAME = "academic-slide-organizer"
+SKILL_VERSION = "1.0.0"
 
 
-def _evidence_map(plan: dict, paper: dict) -> list[dict]:
-    fig_index = {f["id"]: f for f in paper.get("figures", [])}
-    tbl_index = {t["id"]: t for t in paper.get("tables", [])}
-    rows = []
-    for slide in plan["slides"]:
-        sources = []
-        for ev in slide.get("evidence", []):
-            sources.append({
-                "kind": ev.get("kind"), "source_id": ev.get("id"),
-                "page": ev.get("page"), "section": ev.get("section"),
-                "verbatim_quote": ev.get("quote", ""),
-            })
-        for f in slide.get("figures", []):
-            src = fig_index.get(str(f["id"]), {})
-            sources.append({
-                "kind": "figure", "source_id": f["id"], "page": src.get("page"),
-                "section": None, "verbatim_quote": f.get("caption_verbatim", ""),
-                "asset_type": src.get("asset_type"),
-                "is_schematic": f.get("is_schematic"),
-                "is_cited_work": f.get("is_cited_work"),
-            })
-        for t in slide.get("tables", []):
-            src = tbl_index.get(str(t["id"]), {})
-            sources.append({
-                "kind": "table", "source_id": t["id"], "page": src.get("page"),
-                "section": None, "verbatim_quote": src.get("caption", ""),
-            })
-        rows.append({
-            "slide_no": slide["slide_no"],
-            "role": slide["role"],
-            "claim": slide.get("claim", slide.get("title", "")),
-            "source_label": slide.get("source_label", ""),
-            "sources": sources,
-        })
-    return rows
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-def _write_evidence_artifacts(rows: list[dict], output: Path) -> dict:
-    import csv
-    json_path = output / "evidence_map.json"
-    csv_path = output / "evidence_map.csv"
-    write_json(json_path, rows)
-    with csv_path.open("w", encoding="utf-8-sig", newline="") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(["slide_no", "role", "claim", "source_label", "source_count", "sources_detail"])
-        for r in rows:
-            detail = " | ".join(
-                f"{s['kind']} {s.get('source_id') or ''} p.{s.get('page') or '?'}" for s in s_sources(r)
-            )
-            writer.writerow([r["slide_no"], r["role"], r["claim"], r["source_label"],
-                             len(s_sources(r)), detail])
-    xlsx_path = _write_xlsx(rows, output / "evidence_map.xlsx")
-    return {"json": str(json_path), "csv": str(csv_path), "xlsx": str(xlsx_path)}
+def _write_evidence_map(plan, qa, output_dir: Path) -> str:
+    verdict_by_no = {v["slide_no"]: v["verbatim_check"] for v in qa.get("verdicts", [])}
+    lines = ["# Evidence map", "",
+             "Every slide's claims are bound to real source locations. Verdicts come from QA.", ""]
+    for spec in plan["slides"]:
+        tag = " (backup)" if spec.get("backup") else ""
+        lines.append(f"## Slide {spec['slide_no']}{tag} — {spec['role']}")
+        lines.append(f"- Title: {spec['title']}")
+        lines.append(f"- Evidence strength: {spec['evidence_strength']}")
+        for ev in spec.get("evidence", []):
+            ref = ev.get("id") or ev.get("section") or ev.get("kind")
+            label = ev["kind"] if ref == ev["kind"] else f"{ev['kind']} {ref}"
+            lines.append(f"- Source: {label} · p.{ev['page']}")
+            if ev.get("quote"):
+                lines.append(f"  - Quote: \"{ev['quote']}\"")
+        lines.append(f"- Verdict: {verdict_by_no.get(spec['slide_no'], 'flagged')}")
+        lines.append("")
+    path = output_dir / "evidence_map.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return "evidence_map.md"
 
 
-def s_sources(row):
-    return row["sources"]
-
-
-def _write_xlsx(rows: list[dict], path: Path) -> Path:
-    try:
-        from openpyxl import Workbook
-        from openpyxl.styles import Alignment, Font, PatternFill
-    except Exception:
-        return Path("")
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "evidence_map"
-    headers = ["slide", "role", "claim", "source_label", "kind", "source_id", "page", "verbatim"]
-    ws.append(headers)
-    fill = PatternFill("solid", fgColor="1F4E79")
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = fill
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    for r in rows:
-        if not r["sources"]:
-            ws.append([r["slide_no"], r["role"], r["claim"], r["source_label"], "", "", "", ""])
+def _write_notes(plan, output_dir: Path) -> str:
+    lines = ["# Speaker notes", ""]
+    for spec in plan["slides"]:
+        if spec.get("backup"):
             continue
-        for s in r["sources"]:
-            ws.append([
-                r["slide_no"], r["role"], r["claim"], r["source_label"],
-                s.get("kind"), s.get("source_id"), s.get("page"),
-                (s.get("verbatim_quote") or "")[:500],
-            ])
-    widths = [7, 11, 42, 18, 9, 10, 7, 70]
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[chr(64 + i)].width = w
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-    wb.save(str(path))
-    return path
+        lines.append(f"## Slide {spec['slide_no']} — {spec['title']}")
+        lines.append(f"[{spec.get('timing_seconds', 0)}s]")
+        lines.append(spec.get("notes", ""))
+        lines.append("")
+    path = output_dir / "speaker_notes.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return "speaker_notes.md"
 
 
-def _environment(template: dict, render: dict) -> dict:
-    import pptx
-    return {
-        "python": sys.version.split()[0],
-        "platform": platform.platform(),
-        "python_pptx": pptx.__version__,
-        "soffice": render.get("soffice"),
-        "template_used": template.get("source_path"),
-        "slide_size_in": [template.get("slide_width"), template.get("slide_height")],
-        "embedded_fonts": render.get("embedded_fonts"),
-    }
+def _sources(brief) -> list[dict]:
+    out = []
+    for item in brief.get("inventory", []):
+        p = Path(item["file"])
+        if not item.get("exists") or not p.exists():
+            continue
+        try:
+            digest = _sha256(p)
+        except Exception:
+            digest = ""
+        pages = 0
+        if item.get("extension") == ".pdf" or p.suffix.lower() == ".pdf":
+            try:
+                import fitz
+                pages = fitz.open(str(p)).page_count
+            except Exception:
+                pages = 0
+        out.append({
+            "path": item["file"], "role": item.get("role", "other"),
+            "kind": item.get("kind", "other"), "sha256": digest, "pages": pages,
+        })
+    return out
 
 
-def run(work_dir: Path, output_dir: Path) -> dict:
+def run(work_dir=None, output_dir=None, started_at: float | None = None):
+    from common import OUTPUT_DIR, WORK_DIR
+    work_dir = Path(work_dir or WORK_DIR)
+    output_dir = Path(output_dir or OUTPUT_DIR)
     brief = read_json(work_dir / CASE_BRIEF)
-    paper = read_json(work_dir / PAPER_JSON)
     plan = read_json(work_dir / SLIDE_PLAN)
-    qa = read_json(work_dir / QA_REPORT)
-    render = read_json(work_dir / RENDER_JSON)
-    template = read_json(work_dir / TEMPLATE_JSON)
-    changes = ChangeLog(work_dir)
+    qa = read_json(output_dir / QA_REPORT, default={})
+    render = read_json(output_dir / RENDER_JSON, default={})
+    tpl = read_json(work_dir / TEMPLATE_JSON)
+    paper = read_json(work_dir / PAPER_JSON)
 
-    out = ensure_dir(output_dir)
-    previews_out = ensure_dir(out / "previews")
-    case_id = str(brief.get("case_id", "case"))
-    safe_id = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in case_id)
+    evidence_file = _write_evidence_map(plan, qa, output_dir)
+    notes_file = _write_notes(plan, output_dir)
 
-    deck_name = f"{safe_id}_academic_deck.pptx"
-    pdf_name = f"{safe_id}_academic_deck.pdf"
-    deck_path = copy_file(work_dir / "academic_deck.pptx", out / deck_name)
-    pdf_path = copy_file(render["pdf"], out / pdf_name)
-    png_paths = []
-    for png in render["png_previews"]:
-        p = Path(png)
-        png_paths.append(str(copy_file(p, previews_out / p.name)))
+    deck_exists = (output_dir / "deck.pptx").exists()
+    if not deck_exists:
+        status = "blocked"
+    elif qa.get("findings") or not render.get("ok"):
+        status = "partial"
+    else:
+        status = "complete"
 
-    evidence_rows = _evidence_map(plan, paper)
-    evidence_artifacts = _write_evidence_artifacts(evidence_rows, out)
-    plan_path = copy_file(work_dir / SLIDE_PLAN, out / SLIDE_PLAN)
-    qa_path = copy_file(work_dir / QA_REPORT, out / QA_REPORT)
-    paper_path = copy_file(work_dir / PAPER_JSON, out / PAPER_JSON)
-
-    status = "success" if qa["passed"] and not qa["error_count"] else "partial"
+    now = time.time()
+    talk = [s for s in plan["slides"] if not s.get("backup")]
     result = {
-        "case_id": case_id,
+        "case_id": brief["case_id"],
+        "skill": {
+            "name": SKILL_NAME, "version": SKILL_VERSION,
+            "planner": plan.get("planner"), "model_used": None,
+            "started_at": _iso(started_at or now), "finished_at": _iso(now),
+            "duration_seconds": round(now - started_at, 2) if started_at else 0,
+        },
         "status": status,
-        "title": paper.get("title"),
-        "summary": {
-            "spine": plan.get("spine", {}),
-            "slide_count": len(plan["slides"]),
-            "cap": qa.get("cap"),
-            "language": plan.get("language"),
-            "audience": (brief.get("constraints") or {}).get("audience"),
-            "minutes": (brief.get("constraints") or {}).get("minutes"),
+        "status_detail": ("; ".join(qa.get("findings", [])[:6]) or
+                          ("all checks passed" if status == "complete" else "degraded run")),
+        "constraints": {
+            "audience": brief["audience"],
+            "audience_profile": plan["constraints"]["audience_profile"],
+            "time_minutes": brief["time_minutes"], "max_slides": brief["max_slides"],
+            "talk_slides": len(talk),
+            "backup_slides": len(plan["slides"]) - len(talk),
         },
         "artifacts": {
-            "editable_presentation": str(deck_path),
-            "pdf_preview": str(pdf_path),
-            "png_previews": png_paths,
-            "evidence_map": evidence_artifacts,
-            "slide_plan": str(plan_path),
-            "qa_report": str(qa_path),
-            "paper_extraction": str(paper_path),
+            "deck_pptx": "deck.pptx" if deck_exists else None,
+            "deck_pdf": render.get("pdf"),
+            "previews_dir": "previews",
+            "preview_pngs": render.get("previews", []),
+            "slide_plan": SLIDE_PLAN,
+            "evidence_map": evidence_file,
+            "speaker_notes": notes_file,
         },
-        "evidence": evidence_rows,
-        "sources": brief.get("files", []),
+        "evidence_map": [
+            {
+                "slide_no": spec["slide_no"], "backup": bool(spec.get("backup")),
+                "role": spec["role"], "title": spec["title"],
+                "evidence": spec.get("evidence", []),
+                "verbatim_check": next((v["verbatim_check"] for v in qa.get("verdicts", [])
+                                        if v["slide_no"] == spec["slide_no"]), "flagged"),
+            }
+            for spec in plan["slides"]
+        ],
+        "qa_prep": [
+            {
+                "category": item["category"], "question": item["question"],
+                "answer_points": item["answer_points"],
+                "backup_slide_no": item.get("backup_slide_no"),
+            }
+            for item in plan.get("qa_prep", [])
+        ],
+        "sources": _sources(brief),
+        "rendering": {
+            "engine": render.get("engine", "libreoffice+pymupdf"),
+            "fonts": sorted(set(tpl.get("fonts", {}).values())),
+            "theme": tpl.get("name", "scholar-default"),
+            "qa_findings": qa.get("findings", []),
+        },
         "uncertainty": plan.get("uncertainty", []),
-        "warnings": [w.get("issue", str(w)) for w in qa.get("warnings", [])] + brief.get("warnings", []),
-        "errors": [e.get("issue", str(e)) for e in qa.get("errors", [])],
-        "change_records": read_json(work_dir / CHANGE_LOG, default=[]),
-        "environment": _environment(template, render),
-        "output_contract_version": "1.0",
+        "change_records": read_json(work_dir / CHANGE_RECORDS, default=[]) or [],
+        "limitations": plan.get("spine", {}).get("limitations", [])
+        + plan.get("warnings", []),
     }
-    # propagate any organizer-provided output contract keys without overwriting ours
-    contract = (brief.get("constraints") or {}).get("output_contract")
-    if isinstance(contract, dict):
-        for k, v in contract.items():
-            result.setdefault(k, v)
-
-    write_json(out / RESULT_JSON, result)
-    changes.add("finalize", "assemble", f"output ready at {out}")
-    log.info("status=%s artifacts at %s", status, out)
+    write_json(output_dir / "result.json", result)
+    LOG.info("finalized: status=%s, %d slides", status, len(plan["slides"]))
     return result
 
 
-def write_failure_result(work_dir: Path, output_dir: Path, errors: list[str],
-                         status: str = "failed") -> dict:
-    """Honest failure/partial contract when the pipeline cannot complete.
-    Never fabricates deck artifacts or scientific content."""
-    out = ensure_dir(output_dir)
-    brief = read_json(work_dir / CASE_BRIEF, default={})
-    case_id = str(brief.get("case_id", "case"))
-    result = {
-        "case_id": case_id,
-        "status": status,
-        "title": None,
-        "summary": None,
-        "artifacts": {},
-        "evidence": [],
-        "sources": brief.get("files", []),
-        "uncertainty": [],
-        "warnings": brief.get("warnings", []),
-        "errors": errors,
-        "change_records": read_json(work_dir / CHANGE_LOG, default=[]),
-        "environment": {"python": sys.version.split()[0], "platform": platform.platform()},
-        "output_contract_version": "1.0",
-    }
-    write_json(out / RESULT_JSON, result)
-    log.info("status=%s result.json written at %s", status, out)
-    return result
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--work-dir", default=str(WORK_DIR))
-    ap.add_argument("--output-dir", default=str(OUTPUT_DIR))
-    args = ap.parse_args()
-    run(Path(args.work_dir), Path(args.output_dir))
+def _iso(epoch: float) -> str:
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(epoch, timezone.utc).astimezone().isoformat()
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    args = sys.argv[1:]
+    run(args[0] if args else None, args[1] if len(args) > 1 else None)

@@ -1,442 +1,398 @@
 """Deterministic fallback planner.
 
-Builds slide_plan.json directly from paper.json without model calls. It is the
-safety net used when the executing agent cannot author a semantic plan, and the
-baseline the agent is expected to improve. Also provides shared helpers for
-loading verbatim page text and splitting sentences.
+Runs only when no semantic slide_plan.json was produced. Unlike a naive
+"copy the abstract" fallback, it builds the spine from the abstract and
+limitations sections, binds every real figure/table, allocates the frozen
+audience/pace budget, and writes grounded notes and Q&A. It is always
+labeled ``deterministic_fallback`` so it can never masquerade as semantic
+planning.
 """
 from __future__ import annotations
 
-import argparse
 import re
 from pathlib import Path
 
-import fitz
-
 from common import (
-    CASE_BRIEF,
-    PAPER_JSON,
-    SLIDE_PLAN,
-    WORK_DIR,
-    ChangeLog,
-    dehyphenate,
-    get_logger,
-    has_cjk,
-    read_json,
-    truncate_words,
-    write_json,
+    ASSETS_DIR, CHANGE_RECORDS, CASE_BRIEF, PAPER_JSON, SLIDE_PLAN, TEMPLATE_JSON,
+    ChangeLog, get_logger, read_json, truncate_words, write_json, has_cjk,
 )
 
-log = get_logger("autoplan")
-HARD_DEFAULT_CAP = 20
+LOG = get_logger("autoplan")
+SKILL_VERSION = "1.0.0"
+
+_PROFILE_HINTS = {
+    "domain_expert": ("conference", "symposium", "workshop", "session"),
+    "mixed_seminar": ("seminar", "biomedical", "colloquium"),
+    "committee": ("defense", "committee", "review", "panel", "evaluation"),
+    "collaborator": ("group meeting", "lab meeting", "team", "progress", "update"),
+    "general": ("general", "public", "interdisciplinary", "introductory"),
+}
+
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(])")
+_LABEL_PREFIX = re.compile(r"^(figure|fig\.?|table)\s*[0-9A-Za-z]+\.?\s*[:\-]?\s*", re.I)
 
 
-def page_texts(paper: dict, password: str | None = None) -> list[str]:
-    """Re-open the source PDF and return verbatim text per page."""
-    doc = fitz.open(paper["source_pdf"])
-    if doc.needs_pass and not doc.authenticate(""):
-        if not password or not doc.authenticate(password):
-            doc.close()
-            raise PermissionError("encrypted PDF: password rejected")
-    texts = [dehyphenate(doc[i].get_text("text")) for i in range(doc.page_count)]
-    doc.close()
-    return texts
+def _sentences(text: str) -> list[str]:
+    return [s.strip() for s in _SENT_SPLIT.split(text or "") if len(s.strip()) > 20]
 
 
-def split_sentences(text: str) -> list[str]:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    if not text:
-        return []
-    if has_cjk(text):
-        parts = re.split(r"(?<=[。！？；])", text)
-    else:
-        parts = re.split(r"(?<=[.!?;])\s+", text)
-    return [p.strip() for p in parts if p and p.strip()]
+def _profile(audience: str) -> str:
+    low = (audience or "").lower()
+    for profile, hints in _PROFILE_HINTS.items():
+        if any(h in low for h in hints):
+            return profile
+    return "mixed_seminar"
 
 
 def _strip_label(caption: str) -> str:
-    text = re.sub(r"^\s*(?:fig(?:ure)?\.?|table|图|表)\s*[Ss]?\d+(?:\.\d+)?[A-Za-z]?\.?\s*[:：.。]?\s*",
-                  "", caption, flags=re.I).strip()
-    return text.lstrip(":：.。,，;； \t").strip()
+    return _LABEL_PREFIX.sub("", caption or "").strip().rstrip(".")
 
 
-def _clean_title(caption: str, max_chars: int = 190) -> str:
-    text = _strip_label(caption)
-    if len(text) <= max_chars:
-        return text
-    for sep in (". ", "。", "; ", "；", ", ", "，", " "):
-        pos = text.rfind(sep, 0, max_chars)
-        if pos > max_chars * 0.55:
-            return text[:pos].strip()
-    return text[:max_chars].strip()
+def _find_limitations(paper: dict) -> list[dict]:
+    """Return limitation sentences with the real page each one lives on."""
+    hits: list[dict] = []
+    for lvl, title, page in paper.get("toc", []):
+        if re.search(r"limitation|discussion|conclusion", title, re.I):
+            text = paper["page_text"][page - 1] if 0 < page <= len(paper["page_text"]) else ""
+            for s in _sentences(text):
+                if re.search(r"limit|future|however|cannot|caveat|constraint", s, re.I):
+                    hits.append({"text": truncate_words(s, 200), "page": page})
+                if len(hits) >= 4:
+                    return hits
+    return hits
 
 
-def _contexts_for(paper: dict, item_id: str, kind: str) -> list[str]:
+def _abstract_page(paper: dict) -> int:
+    """Locate the page that actually contains the abstract."""
+    abstract = paper.get("abstract", "")
+    needle = re.sub(r"\s+", " ", abstract)[:60].lower()
+    if needle:
+        for i, text in enumerate(paper.get("page_text", [])):
+            if needle in re.sub(r"\s+", " ", text).lower():
+                return i + 1
+    return 1
+
+
+def _clean_context(raw: str) -> str:
+    """Turn a number-index context into a clean, complete sentence."""
+    ctx = re.sub(r"\s+", " ", raw or "").strip()
+    tokens = ctx.split()
+    # drop leading hyphenation fragments (lowercase words continued from above)
+    while tokens and tokens[0][0].islower() and not tokens[0].endswith(":"):
+        tokens.pop(0)
+    ctx = " ".join(tokens).strip()
+    # then drop leading section numbers, e.g. "3.2.1 Scaled ..."
+    ctx = re.sub(r"^(\d+(?:\.\d+)*\.?\s+)+", "", ctx).strip()
+    # trim an incomplete trailing clause after the last full stop
+    if "." in ctx:
+        head, tail = ctx.rsplit(".", 1)
+        if tail.strip() and len(tail.strip()) < 45:
+            ctx = head + "."
+    if not ctx or not ctx[0].isupper():
+        return ""
+    words = re.findall(r"[A-Za-z]+", ctx)
+    digits = re.findall(r"\d+", ctx)
+    if len(words) < 5:
+        return ""
+    if digits and len(digits) > len(words) * 0.6:  # mostly number runs, not prose
+        return ""
+    return truncate_words(ctx, 160)
+
+
+def _first_sentence(text: str, limit: int = 170) -> str:
+    sents = _sentences(text)
+    return truncate_words(sents[0], limit) if sents else truncate_words(text, limit)
+
+
+def _numbers_for_page(paper: dict, page: int, cap: int = 2) -> list[str]:
     out = []
-    for m in paper.get("mentions", []):
-        if m["id"] == item_id and m["kind"] == kind:
-            ctx = _clean_context(m["context"])
-            if ctx and _is_complete_phrase(ctx) and ctx not in out:
+    seen = set()
+    for item in paper.get("number_index", []):
+        if item.get("page") == page and item.get("token"):
+            ctx = _clean_context(item.get("context", ""))
+            key = ctx[:60].lower()
+            if ctx and key not in seen:
+                seen.add(key)
                 out.append(ctx)
-    return out[:3]
+        if len(out) >= cap:
+            break
+    return out
 
 
-_POINTER_RE = re.compile(
-    r"^(?:we (?:present|show|summarize|give|report)\b.*(?:in|see)\s*"
-    r"(?:table|fig(?:ure)?)\s*[Ss]?\d+|"
-    r"(?:table|fig(?:ure)?)\s*[Ss]?\d+\s+(?:summarizes?|shows?|presents?|lists?|gives?)\b"
-    r".*(?:literature|results?)\.?)$", re.I)
-_SECTION_LEAD_RE = re.compile(r"^(?:\d+(?:\.\d+)*\s+[A-Z][A-Za-z &]+\s*)+")
+def _evidence_for(kind: str, fid: str, page: int, quote: str) -> dict:
+    return {"kind": kind, "id": fid, "page": page, "quote": truncate_words(quote, 380)}
 
 
-def _truncate_phrase(text: str, limit: int) -> str:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    if len(text) <= limit:
-        return text
-    window = text[:limit]
-    for sep in ("; ", ", ", "，", "; ", "，", " "):
-        pos = window.rfind(sep)
-        if pos > limit * 0.6:
-            return window[:pos].strip(" ,;，")
-    return window.rstrip(" ,;，")
+def _normalize_timing(slides: list[dict], budget_seconds: float) -> None:
+    """Scale talk-slide timing so the total matches the real time budget."""
+    talk = [s for s in slides if not s.get("backup")]
+    current = sum(s["timing_seconds"] for s in talk)
+    if current <= 0:
+        return
+    factor = budget_seconds / current
+    for s in talk:
+        s["timing_seconds"] = max(15, round(s["timing_seconds"] * factor))
+    # absorb rounding drift on the longest slide
+    drift = budget_seconds - sum(s["timing_seconds"] for s in talk)
+    if talk and abs(drift) > 0:
+        talk[-1]["timing_seconds"] = max(15, talk[-1]["timing_seconds"] + round(drift))
 
 
-def _clean_context(text: str) -> str:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    # drop leading numbered section headings (e.g. "6 Results 6.1 Machine Translation")
-    text = _SECTION_LEAD_RE.sub("", text).strip()
-    if _POINTER_RE.match(text):
-        return ""
-    return text
+def build_plan(brief: dict, paper: dict, tpl: dict) -> dict:
+    audience = brief["audience"]
+    profile = _profile(audience)
+    pacing = brief["pacing"]
+    talk_target = min(pacing["talk_slide_target"], brief["max_slides"])
+    backup_budget = max(0, brief["max_slides"] - talk_target)
+    secs_per = pacing["target_seconds_per_slide"]
+    lang = "zh" if paper.get("language", "").startswith("zh") or has_cjk(paper.get("title", "")) else "en"
 
+    abstract_sents = _sentences(paper.get("abstract", ""))
+    problem = truncate_words(abstract_sents[0], 220) if abstract_sents else paper.get("title", "")
+    approach = next((s for s in abstract_sents
+                     if re.search(r"we (propose|introduce|present|develop|describe)|here we", s, re.I)),
+                    truncate_words(abstract_sents[len(abstract_sents) // 2], 220)
+                    if abstract_sents else "")
+    limitations = _find_limitations(paper)
+    abs_page = _abstract_page(paper)
 
-def _is_complete_phrase(text: str) -> bool:
-    text = (text or "").strip()
-    if not text:
-        return False
-    if has_cjk(text):
-        return len(text) >= 6
-    # reject fragments that begin with a lowercase verb or dangling punctuation
-    if text[0] in ").,;:" or text[0].islower():
-        return False
-    return len(text) >= 12 and len(text.split()) >= 3
+    figures = paper.get("figures", [])
+    tables = paper.get("tables", [])
 
-
-def _evidence_for(item: dict, page_text: str) -> dict:
-    quote = truncate_words(page_text, 220)
-    return {"kind": item["kind"], "id": item["id"], "page": item["page"],
-            "section": None, "quote": quote}
-
-
-def _caption_topic(item: dict, lang: str) -> str:
-    """A short, item-specific topic from the caption (label stripped), used to
-    make speaker notes on repeated templates distinguishable."""
-    cap = _strip_label(item.get("caption", ""))
-    if not cap:
-        return ""
-    if lang == "zh":
-        chars = re.findall(r"[\u4e00-\u9fff]+", cap)
-        topic = "".join(chars)[:14]
-        return topic
-    words = re.findall(r"[A-Za-z][A-Za-z\-]+", cap)
-    return " ".join(words[:6])
-
-
-def _evidence_notes(kind: str, item: dict, kind_idx: int, total: int,
-                    has_context: bool, lang: str) -> str:
-    label = f"{'Fig' if kind == 'figure' else 'Table'} {item['id']}"
-    page = item["page"]
-    if lang == "zh":
-        if kind == "table":
-            frames = [
-                f"先定位第 {page} 页{label}，带听众读表头与关键一列，再点出对比方向，避免逐行念。",
-                f"这张{label}（第 {page} 页）只讲结论：先给对比方向，再用一两个数值佐证，细节留给提问。",
-                f"借助{label}过渡到结果：指出第 {page} 页最值得注意的行，说明它如何回应前面的问题。",
-                f"围绕{label}做一次小结，提醒听众关注第 {page} 页的口径与单位，再继续下一张。",
-                f"用提问带出{label}：先让大家在第 {page} 页找关键差异，再公布答案并解释原因。",
-            ]
-        elif item.get("is_schematic"):
-            frames = [
-                f"{label}是结构示意（第 {page} 页），按信息流向讲清模块关系，不纠缠图形细节。",
-                f"用第 {page} 页这张{label}串起整体设计，强调它在论证链条中的位置。",
-                f"面对{label}先给全局再讲局部，让听众记住各模块如何协作（原图见第 {page} 页）。",
-                f"借{label}回顾术语：指着第 {page} 页的关键部件命名，为后续结果页铺垫。",
-                f"以{label}为地图，说明输入如何一步步变成输出，必要时回到第 {page} 页。",
-            ]
-        else:
-            frames = [
-                f"让视线先落在第 {page} 页{label}的关键区域，一句话给出它支撑的结论，再补条件。",
-                f"这张{label}（第 {page} 页）与上一张形成递进，先指变化再解释含义。",
-                f"从{label}切入：描述图中现象，再落到它证明了什么，必要时翻回第 {page} 页核对。",
-                f"提醒听众注意{label}里容易忽略的细节，再说明它如何强化第 {page} 页的论点。",
-                f"用对比的方式讲{label}：先讲看图方法，再让结论自然浮现（原图第 {page} 页）。",
-                f"围绕第 {page} 页{label}先给结论再回看证据，指出支撑这一结论的具体位置。",
-                f"把{label}放进整体叙事：说明第 {page} 页这一步要回答什么问题，再点出答案。",
-                f"用一句话概括{label}的要点，随后带听众在第 {page} 页核对图中的趋势与条件。",
-            ]
-        topic = _caption_topic(item, "zh")
-        tail = f"（证据 {kind_idx + 1}/{total}）"
-        if topic:
-            tail = f"主题：{topic}。" + tail
-        return frames[kind_idx % len(frames)] + tail
-    if kind == "table":
-        frames = [
-            f"On page {page}, anchor {label} at the header and the key comparison column, then give the direction of effect instead of reading rows.",
-            f"Use {label} (page {page}) for the bottom line: state the contrast first, support it with one or two values, and hold the rest for questions.",
-            f"Transition to results through {label}: point to the most informative row on page {page} and tie it back to the opening question.",
-            f"Use {label} as a quick checkpoint: note the units and setup on page {page} before moving on.",
-            f"Pose a question around {label}, let the audience spot the difference on page {page}, then reveal the answer and its implication.",
-        ]
-    elif item.get("is_schematic"):
-        frames = [
-            f"{label} on page {page} is a schematic; follow the data flow and module roles rather than visual detail.",
-            f"Use the {label} diagram (page {page}) to connect the whole design, emphasising where it sits in the argument.",
-            f"Give the big picture of {label} first, then zoom into parts the audience needs to remember; the original is on page {page}.",
-            f"Introduce terminology through {label}: name the key components on page {page} to set up the result slides.",
-            f"Treat {label} as a map of how input becomes output, returning to page {page} if details are needed.",
-        ]
-    else:
-        frames = [
-            f"Point first to the key region of {label} on page {page}, give the one-sentence conclusion, then add the conditions.",
-            f"{label} (page {page}) extends the previous point: name the change, then explain what it means.",
-            f"Start from what {label} shows on page {page}, describe the pattern, then land on the claim it supports.",
-            f"Draw attention to the easy-to-miss detail in {label} and show how it reinforces the argument on page {page}.",
-            f"Teach how to read {label} first, then let the conclusion emerge; the original figure is on page {page}.",
-            f"Give the conclusion from {label} first, then trace back to the exact spot on page {page} that supports it.",
-            f"Place {label} in the story: state the question on page {page} it answers, then give the answer.",
-            f"Summarise {label} in one line, then walk the audience through the trend and conditions shown on page {page}.",
-        ]
-    topic = _caption_topic(item, "en")
-    tail = f"(evidence {kind_idx + 1}/{total})"
-    if topic:
-        tail = f"Topic: {topic}. " + tail
-    return frames[kind_idx % len(frames)] + tail
-
-
-def build_plan(work_dir: Path) -> dict:
-    brief = read_json(work_dir / CASE_BRIEF)
-    paper = read_json(work_dir / PAPER_JSON)
-    constraints = brief.get("constraints", {})
-    texts = page_texts(paper, constraints.get("pdf_password"))
-    cap = constraints.get("max_slides") or HARD_DEFAULT_CAP
-    lang = paper.get("language", "en")
+    # ---- main-deck slide assembly -----------------------------------------
+    slides: list[dict] = []
     uncertainty: list[str] = []
 
-    uncaptioned = [f for f in paper.get("figures", []) if f.get("uncaptioned")]
-    for f in uncaptioned:
-        uncertainty.append(
-            f"uncaptioned image {f['id']} (p.{f['page']}): kept verbatim as image; no source label or caption exists")
-
-    abstract_text = paper.get("abstract", "")
-    if paper.get("scanned"):
-        ocr_combined = " ".join(paper.get("ocr_texts", {}).values()).strip()
-        if ocr_combined and not abstract_text:
-            abstract_text = ocr_combined
-            uncertainty.append("scanned PDF: content derived from OCR and may contain errors")
-        uncertainty.append(
-            "scanned PDF: text layer unavailable; evidence located at page level via rendered page images")
-    abstract_sents = split_sentences(abstract_text)
-    spine = {
-        "problem": abstract_sents[0] if abstract_sents else truncate_words(paper.get("abstract", ""), 200),
-        "gap": abstract_sents[1] if len(abstract_sents) > 1 else "",
-        "method": next((s for s in abstract_sents if re.search(r"method|approach|propose|develop|we use|采用|方法|构建", s, re.I)), ""),
-        "key_results": [s for s in abstract_sents
-                        if re.search(r"\d|result|show|increase|decrease|reach|recover|sensitivity|improv|发现|结果|显著", s, re.I)
-                        and not re.search(r"require|noisy|remain|需要|噪声", s, re.I)][:4],
-        "contribution": abstract_sents[-1] if abstract_sents else "",
-        "limitations": [],
-    }
-
-    deck_title = paper.get("title", "")
-    if not deck_title and paper.get("scanned"):
-        deck_title = "Scanned research document (title not recoverable from source)"
-
-    slides: list[dict] = []
-    # 1. title
     slides.append({
-        "slide_no": 1, "role": "title", "layout_role": "title",
-        "title": truncate_words(deck_title, 180),
-        "claim": deck_title,
-        "bullets": [{"text": paper.get("authors", ""), "level": 0}],
+        "slide_no": 1, "role": "title", "backup": False,
+        "title": truncate_words(paper.get("title", "Academic talk"), 100),
+        "bullets": [{"text": truncate_words(paper.get("authors", ""), 200), "level": 0},
+                    {"text": audience, "level": 0}],
         "figures": [], "tables": [],
-        "evidence": [{"kind": "page", "id": None, "page": 1, "section": None,
-                      "quote": truncate_words(texts[0] if texts else "", 200)}],
-        "notes": "Open the talk by stating the paper title and authors; one sentence on why this question matters to the audience.",
-        "source_label": "p.1",
+        "evidence": [{"kind": "abstract", "page": abs_page, "section": "title"}],
+        "evidence_strength": "background",
+        "notes": (f"Open by stating the paper title and authors. Frame the talk for {audience}: "
+                 "say what the question is and why it matters before any method detail."),
+        "timing_seconds": max(20, int(secs_per * 0.5)),
     })
 
-    # 2. problem / background
-    problem_bullets = [{"text": truncate_words(s, 160), "level": 0}
-                       for s in abstract_sents[:2] if s][:3]
-    if not problem_bullets:
-        problem_bullets = [{"text": spine["problem"], "level": 0}]
-    slides.append({
-        "slide_no": 2, "role": "content", "layout_role": "content",
-        "title": "研究背景与问题" if lang == "zh" else "Background and problem",
-        "claim": spine["problem"],
-        "bullets": problem_bullets, "figures": [], "tables": [],
-        "evidence": [{"kind": "page", "id": None, "page": 1, "section": "Abstract",
-                      "quote": truncate_words(paper.get("abstract", ""), 220)}],
-        "notes": "Frame the gap before naming the solution; pause after the problem statement so the audience feels the motivation.",
-        "source_label": "Abstract · p.1",
-    })
-
-    # 3. method overview
-    method_sent = spine["method"] or (abstract_sents[2] if len(abstract_sents) > 2 else "")
-    if method_sent:
+    # background / problem from abstract
+    bg_bullets = [{"text": truncate_words(s, 200), "level": 0}
+                  for s in abstract_sents[:2] if s]
+    if bg_bullets:
         slides.append({
-            "slide_no": 3, "role": "content", "layout_role": "content",
-            "title": "核心方法" if lang == "zh" else "Core approach",
-            "claim": truncate_words(method_sent, 160),
-            "bullets": [{"text": truncate_words(method_sent, 180), "level": 0}],
+            "slide_no": len(slides) + 1, "role": "problem", "backup": False,
+            "title": "The problem the field faces",
+            "bullets": bg_bullets[:4],
             "figures": [], "tables": [],
-            "evidence": [{"kind": "page", "id": None, "page": 1, "section": "Abstract",
-                          "quote": truncate_words(method_sent, 220)}],
-            "notes": "Explain the approach at the conceptual level first; details follow with the evidence slides.",
-            "source_label": "Abstract · p.1",
+            "evidence": [{"kind": "abstract", "page": abs_page, "quote": truncate_words(paper.get("abstract", ""), 380)}],
+            "evidence_strength": "background",
+            "notes": "Set up the limitation of existing approaches using the abstract's framing. "
+                     "Do not introduce the new method on this slide; the gap must be felt first.",
+            "timing_seconds": int(secs_per),
         })
 
-    # budget for evidence slides
-    fixed = len(slides) + 1  # reserve conclusion
-    evidence_cap = max(0, cap - fixed)
-    items = [("figure", f) for f in paper.get("figures", [])]
-    items += [("table", t) for t in paper.get("tables", [])]
-    for t in paper.get("tables", []):
-        if t.get("row_count", 0) == 0:
-            uncertainty.append(
-                f"table {t['id']} (p.{t['page']}) could not be reconstructed reliably; "
-                "kept as a source reference rather than rendering uncertain cells")
-
-    def _rank_key(entry: tuple) -> int:
-        kind, item = entry
-        if kind == "figure" and item.get("is_schematic"):
-            return 2  # schematics are weakest standalone evidence
-        if kind == "table":
-            return 1
-        return 0  # data figures first
-
-    if len(items) > evidence_cap:
-        # compression: prioritize data figures, then tables, schematics last
-        ranked = sorted(items, key=_rank_key)
-        if evidence_cap > 0:
-            step = len(ranked) / evidence_cap
-            chosen_idx = sorted({min(len(ranked) - 1, int(i * step)) for i in range(evidence_cap)})
-            selected = [ranked[k] for k in chosen_idx]
-        else:
-            selected = []
-        omitted = [it for it in items if it not in selected]
-        labels = ", ".join(f"{k} {it['id']}" for k, it in omitted)
-        uncertainty.append(f"{len(omitted)} evidence items omitted ({labels}) to respect slide cap {cap}")
-    else:
-        selected = items
-
-    total_evidence = len(selected)
-    kind_counter: dict[str, int] = {}
-    for seq, (kind, item) in enumerate(selected, start=1):
-        kind_counter[kind] = kind_counter.get(kind, 0) + 1
-        kind_idx = kind_counter[kind] - 1
-        page_text = texts[item["page"] - 1] if 0 < item["page"] <= len(texts) else ""
-        contexts = _contexts_for(paper, item["id"], kind)
-        # pages where the in-text discussion actually appears (may differ from
-        # the item's own page), so every number stays traceable
-        mention_pages = sorted({m["page"] for m in paper.get("mentions", [])
-                                if m["id"] == item["id"] and m["kind"] == kind})
-        evidence = [_evidence_for(item, page_text)]
-        for mp in mention_pages:
-            if mp == item["page"] or not (1 <= mp <= len(texts)):
-                continue
-            evidence.append({"kind": "page", "id": None, "page": mp,
-                             "section": "in-text reference",
-                             "quote": truncate_words(texts[mp - 1], 200)})
-        # bullets only carry in-text discussion; never duplicate the caption
-        bullets = [{"text": _truncate_phrase(c, 170), "level": 0} for c in contexts]
-        if not bullets:
-            if lang == "zh":
-                fallback = ("按信息流向理解各模块如何连接" if item.get("is_schematic")
-                            else "先定位关键趋势/区域，再结合图注中的条件与样本量")
-            else:
-                fallback = ("Follow the data flow to see how the components connect"
-                            if item.get("is_schematic")
-                            else "Locate the key trend or region, then use the caption's conditions and sample size")
-            bullets = [{"text": fallback, "level": 0}]
-        slide = {
-            "slide_no": len(slides) + 1,
-            "role": kind, "layout_role": "figure" if kind == "figure" else "content",
-            "title": _clean_title(item.get("caption", "") or f"{kind} {item['id']}"),
-            "claim": _clean_title(item.get("caption", ""), 220),
-            "bullets": bullets,
+    if approach:
+        slides.append({
+            "slide_no": len(slides) + 1, "role": "method", "backup": False,
+            "title": "Core idea and approach",
+            "bullets": [{"text": truncate_words(approach, 210), "level": 0}],
             "figures": [], "tables": [],
-            "evidence": evidence,
-            "notes": _evidence_notes(kind, item, kind_idx, total_evidence,
-                                     bool(contexts), lang),
-            "source_label": f"{'Fig' if kind == 'figure' else 'Table'} {item['id']} · p.{item['page']}",
-        }
-        if kind == "figure":
-            slide["figures"] = [{
-                "id": item["id"], "kind": "figure",
-                "asset_path": item["asset_path"],
-                "caption_verbatim": item.get("caption", ""),
-                "is_schematic": item.get("is_schematic", False),
-                "is_cited_work": item.get("is_cited_work", False),
-            }]
-        else:
-            if item.get("row_count", 0) > 0:
-                slide["tables"] = [{"id": item["id"]}]
-            else:
-                # honest source-reference slide; no uncertain cells rendered
-                cue = ("完整表格见源论文第 " + str(item["page"]) + " 页，本页仅作要点指引"
-                       if lang == "zh"
-                       else f"Full table on source page {item['page']}; refer to it directly for exact values")
-                slide["bullets"] = [{"text": cue, "level": 0}]
-                slide["layout_role"] = "content"
-        slides.append(slide)
+            "evidence": [{"kind": "abstract", "page": abs_page, "quote": truncate_words(approach, 380)}],
+            "evidence_strength": "mechanistic",
+            "notes": "State the central idea in one sentence before the components. Explain what "
+                     "makes this approach different from the prior work just described.",
+            "timing_seconds": int(secs_per),
+        })
 
-    # final conclusion — evidence spans the abstract (results originate there)
-    # and the final discussion page so every number remains traceable
-    result_sents = spine["key_results"] or abstract_sents[-2:]
-    conclusion_evidence = [
-        {"kind": "page", "id": None, "page": 1, "section": "Abstract",
-         "quote": truncate_words(paper.get("abstract", ""), 220)},
-        {"kind": "page", "id": None, "page": paper["page_count"],
-         "section": "Conclusion",
-         "quote": truncate_words(texts[-1] if texts else "", 220)},
-    ]
+    # reserve slots: figures on main deck until budget, remainder to backup
+    reserved_fixed = len(slides) + (1 if limitations else 0) + 1  # +limits +conclusion
+    main_fig_cap = max(0, talk_target - reserved_fixed)
+    main_figs = figures[:main_fig_cap] if main_fig_cap else figures[:max(1, talk_target - len(slides) - 2)]
+    backup_figs = figures[len(main_figs):]
+
+    for fig in main_figs:
+        cap = fig.get("caption", "")
+        topic = _strip_label(cap)
+        # the complete caption sentence is the faithful text; the figure
+        # itself carries the measured evidence, so no fragment sub-bullets
+        bullets = [{"text": _first_sentence(topic), "level": 0}]
+        asset_ok = fig.get("asset", {}).get("file")
+        strength = "mechanistic" if fig.get("figure_type") == "schematic" else "direct"
+        slides.append({
+            "slide_no": len(slides) + 1,
+            "role": "mechanism" if strength == "mechanistic" else "result",
+            "backup": False,
+            "title": truncate_words(("Architecture: " if strength == "mechanistic" else "Result: ") + topic, 70),
+            "bullets": bullets[:3],
+            "figures": [fig["id"]], "tables": [],
+            "evidence": [_evidence_for("figure", fig["id"], fig["page"], cap)],
+            "evidence_strength": strength,
+            "notes": (f"Walk the audience through {fig['id']} on page {fig['page']}. Say what the "
+                     "axes/components are, point to the feature that supports the claim, then restate "
+                     "the takeaway. Keep the numbers on screen as they appear in the source."),
+            "timing_seconds": int(secs_per * 1.2 if strength == "mechanistic" else secs_per),
+            "source_label": f"{fig['id']} · p.{fig['page']}",
+        })
+        if not asset_ok:
+            uncertainty.append(f"{fig['id']} has no usable raster asset; builder uses a placeholder.")
+
+    # tables: first table on main deck only if budget remains
+    main_tables, backup_tables = [], tables
+    if len(slides) + 2 <= talk_target and tables:
+        main_tables = tables[:1]
+        backup_tables = tables[1:]
+    for tab in main_tables:
+        topic = _strip_label(tab.get("caption", ""))
+        slides.append({
+            "slide_no": len(slides) + 1, "role": "comparison", "backup": False,
+            "title": truncate_words("Comparison: " + topic, 70),
+            "bullets": [{"text": "Key rows from the source table; full table bound for review.", "level": 0}],
+            "figures": [], "tables": [tab["id"]],
+            "evidence": [_evidence_for("table", tab["id"], tab["page"], tab.get("caption", ""))],
+            "evidence_strength": "comparative",
+            "notes": (f"Use {tab['id']} on page {tab['page']} to compare conditions. Read the header "
+                     "row first, then the rows that support the claim. Do not restate every cell."),
+            "timing_seconds": int(secs_per),
+            "source_label": f"{tab['id']} · p.{tab['page']}",
+        })
+
+    if limitations:
+        slides.append({
+            "slide_no": len(slides) + 1, "role": "limitation", "backup": False,
+            "title": "Stated limitations and boundaries",
+            "bullets": [{"text": item["text"], "level": 0} for item in limitations[:4]],
+            "figures": [], "tables": [],
+            "evidence": [{"kind": "section", "page": limitations[0]["page"],
+                          # one contiguous source sentence, never a stitched composite
+                          "quote": truncate_words(limitations[0]["text"], 380)}],
+            "evidence_strength": "background",
+            "notes": "Present the authors' own caveats candidly. Naming the boundary is what makes the "
+                     "closing claim credible. Do not add criticisms the paper does not state.",
+            "timing_seconds": int(secs_per * 0.9),
+        })
+    else:
+        uncertainty.append("No explicit limitations section detected; limitation slide omitted.")
+
+    # conclusion: the answer (approach) plus the strongest evidence, in that order
+    conclusion_pts = []
+    if approach:
+        conclusion_pts.append("Answer: " + truncate_words(approach, 170))
+    for fig in figures[:2]:
+        conclusion_pts.append("Evidence: " + truncate_words(_strip_label(fig.get("caption", "")), 150))
+    if not conclusion_pts:
+        conclusion_pts = [truncate_words(problem, 180)]
     slides.append({
-        "slide_no": len(slides) + 1, "role": "conclusion", "layout_role": "content",
-        "title": "结论与贡献" if lang == "zh" else "Conclusions and contribution",
-        "claim": spine["contribution"] or (result_sents[-1] if result_sents else ""),
-        "bullets": [{"text": truncate_words(s, 170), "level": 0} for s in result_sents][:4]
-                   or [{"text": truncate_words(spine["contribution"], 170), "level": 0}],
+        "slide_no": len(slides) + 1, "role": "conclusion", "backup": False,
+        "title": "Takeaway",
+        "bullets": [{"text": s, "level": 0} for s in conclusion_pts[:3]],
         "figures": [], "tables": [],
-        "evidence": conclusion_evidence,
-        "notes": "Land the take-home message explicitly, then name the contribution in one sentence; invite questions on limitations.",
-        "source_label": f"Abstract p.1 · Conclusion p.{paper['page_count']}",
+        "evidence": [{"kind": "abstract", "page": abs_page, "quote": truncate_words(paper.get("abstract", ""), 380)}],
+        "evidence_strength": "background",
+        "notes": "Close by returning to the opening question and stating the answer the evidence "
+                 "supports, keeping the same hedging as the source. Then invite questions.",
+        "timing_seconds": max(25, int(secs_per * 0.7)),
     })
 
+    # ---- backup slides -----------------------------------------------------
+    backup_specs = [(f, "figure") for f in backup_figs] + [(t, "table") for t in backup_tables]
+    backup_specs = backup_specs[:max(backup_budget, 0)]
+    for item, kind in backup_specs:
+        topic = _strip_label(item.get("caption", ""))
+        slides.append({
+            "slide_no": len(slides) + 1, "role": "backup", "backup": True,
+            "title": truncate_words("Backup: " + topic, 70),
+            "bullets": [{"text": truncate_words(topic, 200), "level": 0}],
+            "figures": [item["id"]] if kind == "figure" else [],
+            "tables": [item["id"]] if kind == "table" else [],
+            "evidence": [_evidence_for(kind, item["id"], item["page"], item.get("caption", ""))],
+            "evidence_strength": "direct" if kind == "figure" else "comparative",
+            "notes": (f"Reference detail for {item['id']} (page {item['page']}), held in reserve for "
+                     "questions. Only show if asked; keep the answer tied to this source."),
+            "timing_seconds": int(secs_per),
+            "source_label": f"{item['id']} · p.{item['page']}",
+        })
+
+    # ---- Q&A grounded in real content -------------------------------------
+    qa = []
+    if limitations:
+        qa.append({"category": "limitation",
+                   "question": "How do the stated limitations bound the strength of the conclusion?",
+                   "answer_points": [i["text"] for i in limitations[:3]],
+                   "evidence": [{"kind": "section", "page": limitations[0]["page"],
+                                 "quote": truncate_words(limitations[0]["text"], 380)}],
+                   "backup_slide_no": None})
+    if figures:
+        f0 = figures[0]
+        qa.append({"category": "mechanism",
+                   "question": f"What is the mechanism behind {f0['id']} and why does it work?",
+                   "answer_points": [truncate_words(_strip_label(f0.get("caption", "")), 200)],
+                   "evidence": [_evidence_for("figure", f0["id"], f0["page"], f0.get("caption", ""))],
+                   "backup_slide_no": next((s["slide_no"] for s in slides if f0["id"] in s["figures"] and s["backup"]), None)})
+    if tables:
+        t0 = tables[0]
+        qa.append({"category": "controls",
+                   "question": "How fair is the comparison against the reported baselines?",
+                   "answer_points": [truncate_words(_strip_label(t0.get("caption", "")), 200)],
+                   "evidence": [_evidence_for("table", t0["id"], t0["page"], t0.get("caption", ""))],
+                   "backup_slide_no": next((s["slide_no"] for s in slides if t0["id"] in s["tables"] and s["backup"]), None)})
+    qa.append({"category": "general",
+               "question": "What is the single most important takeaway?",
+               "answer_points": [truncate_words(approach or problem, 200)],
+               "evidence": [{"kind": "abstract", "page": abs_page}],
+               "backup_slide_no": None})
+
+    _normalize_timing(slides, brief["time_minutes"] * 60)
+
     plan = {
-        "version": "1.0",
-        "case_id": brief.get("case_id"),
+        "version": SKILL_VERSION,
+        "case_id": brief["case_id"],
         "planner": "deterministic_fallback",
         "language": lang,
-        "constraints": constraints,
-        "spine": spine,
+        "constraints": {
+            "audience": audience,
+            "audience_profile": profile,
+            "time_minutes": brief["time_minutes"],
+            "max_slides": brief["max_slides"],
+            "talk_slides": len([s for s in slides if not s["backup"]]),
+            "backup_slides": len([s for s in slides if s["backup"]]),
+            "seconds_per_slide": secs_per,
+        },
+        "spine": {
+            "problem": problem,
+            "gap": truncate_words(abstract_sents[1], 220) if len(abstract_sents) > 1 else problem,
+            "approach": truncate_words(approach, 220),
+            "key_evidence": [truncate_words(_strip_label(f.get("caption", "")), 120) for f in figures[:5]],
+            "contributions": [truncate_words(approach, 200)] if approach else [],
+            "limitations": [i["text"] for i in limitations],
+        },
         "slides": slides,
+        "qa_prep": qa,
         "uncertainty": uncertainty,
-        "warnings": brief.get("warnings", []),
+        "warnings": ["Deterministic fallback planning: claim wording is caption-derived; semantic "
+                     "planning gives audience-specific claim framing.",
+                     "Table reconstruction is best-effort: all data cells are faithful, but a few "
+                     "multi-word headers may span an adjacent column; the source page is bound for review."],
     }
-    write_json(work_dir / SLIDE_PLAN, plan)
-    changes = ChangeLog(work_dir)
-    changes.add("planning", "autoplan", f"{len(slides)} slides within cap {cap}")
-    log.info("fallback plan: %d slides, uncertainty=%d", len(slides), len(uncertainty))
     return plan
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--work-dir", default=str(WORK_DIR))
-    args = ap.parse_args()
-    build_plan(Path(args.work_dir))
+def run(work_dir: Path | None = None) -> dict:
+    work_dir = Path(work_dir)
+    brief = read_json(work_dir / CASE_BRIEF)
+    paper = read_json(work_dir / PAPER_JSON)
+    tpl = read_json(work_dir / TEMPLATE_JSON)
+    plan = build_plan(brief, paper, tpl)
+    write_json(work_dir / SLIDE_PLAN, plan)
+    changelog = ChangeLog(work_dir)
+    changelog.add("autoplan", "deterministic plan",
+                  f"{plan['constraints']['talk_slides']} talk + {plan['constraints']['backup_slides']} backup")
+    LOG.info("fallback plan: %d slides (%d backup)",
+             len(plan["slides"]), plan["constraints"]["backup_slides"])
+    return plan
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    from common import WORK_DIR
+    run(Path(sys.argv[1]) if len(sys.argv) > 1 else WORK_DIR)
