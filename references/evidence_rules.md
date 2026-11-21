@@ -1,59 +1,77 @@
-# 证据保真规则（Evidence Fidelity Rules）
+# Evidence rules
 
-学术 PPT 的每个字都要能被复核。以下规则在规划、构建、QA 三阶段强制执行；任何一条无法满足都要在 `uncertainty` 或 `warnings` 中显式说明，禁止静默处理。
+The skill is judged on whether every on-slide claim can be located in the
+source. These rules define what counts as evidence, how strong it is, and
+how claims may be worded.
 
-## 1. 数字、单位与名称逐字搬运
+## Evidence strength (the `evidence_strength` field)
 
-- 数值、百分号、正负号、小数位、置信区间、p 值、样本量（n=...）必须与论文**完全一致**，禁止四舍五入、单位换算或数量级改写。
-- 单位逐字保留（kDa、mg/mL、µg、nm、eV、°C、mmol/L 等）；中文论文的单位写法（如“倍”“例”“岁”）同样保留。
-- 方法名、材料名、基因/蛋白名、仪器型号、数据库版本按原文书写，不做“通俗化”改名；确需解释时在备注中补充，原名不变。
-- 正确写法：先在 `evidence.quote` 中粘贴含该数字的原文片段，再从片段中提取数字写入要点。QA 会对要点中的每个数字/单位在被引页做逐字匹配，匹配不上即告警。
+- **direct** — the claim is a measured result shown in a figure or table on
+  the bound page (e.g., a reported BLEU score, an observed regression
+  coefficient, a measured yield). Use for result slides.
+- **comparative** — the claim compares two or more real conditions,
+  baselines or groups, and both sides are in the source (ablation,
+  baseline table, treatment vs control).
+- **mechanistic** — the claim explains why, using the paper's proposed
+  mechanism or causal pathway. The paper may propose rather than prove;
+  keep the wording as the authors do ("suggests", "is consistent with").
+- **background** — established context, definitions, or the problem
+  framing. Background claims still need a page, but never carry a headline
+  result.
 
-## 2. 图表编号与文内引用对齐
+A slide may mix strengths; assign the strength of its headline claim.
+Never label a mechanistic interpretation as a direct result.
 
-- 幻灯片只允许引用 `paper.json` 中实际检测到的图/表编号；编号可能带字母（Fig. 2A）或补充材料前缀（Fig. S1），按原文保留。
-- 文内出现“as shown in Fig. 3 / 如图 3 所示”时，`paper.json.mentions` 记录了页码与上下文；规划证据页时优先用这些真实被引用的位置，避免“讲到第三页引用了不存在的图”。
-- 一个图含多个子图（A/B/C）时，若只展示整图裁剪，主张不得只描述其中一个子图的结论；需要聚焦子图时在备注中说明，且不得用裁剪删除原图信息（附件原图不裁剪，只缩放）。
+## What is valid evidence
 
-## 3. 图注逐字保留
+- A figure id with a real `page` and a caption that supports the claim.
+- A table id with rows containing the exact value being quoted.
+- A section/page with a short verbatim `quote` (≤400 chars) for prose
+  claims, contributions or limitations.
+- The abstract, bound as kind `abstract`, for framing and headline claims
+  only — not for detailed numbers that the results section states
+  differently.
 
-- 图注（caption）是证据的组成部分：包含实验条件、样本量、统计标记（* p<0.05）、缩写定义。构建脚本会把图注逐字放在图下方，禁止改写或删节；过长时由脚本控制字号与换行，不删减内容。
-- 图注中的条件说明（如“mean ± SD, n=6”）必须可见或在备注中复述，这是被提问时的第一防线。
+Invalid evidence: reference-list entries, author affiliations, journal
+stamps, cover pages, web links, and anything outside the provided
+materials.
 
-## 4. 示意图与实验数据严格区分
+## Wording rules
 
-- 证据类型标记：`paper.json` 依据 caption 关键词（schematic/diagram/workflow/示意/流程/概念）标注 `is_schematic`。
-- 示意图/流程图/概念图只能用于解释机制与方法，**不得作为实验结果证据**，主张中不得为其编造数据结论。
-- 数据图（折线、柱状、散点、热图、显微照片等）承载定量/定性结论；照片类证据（如成像、实物图）按原文条件描述，不做超出图注的推断。
-- 一张幻灯片同时含示意图与数据图时，角色与备注必须说明各自用途，防止读者混淆。
+- **Numbers are copied, never rounded or recomputed.** If the slide needs
+  a comparison, state the two source values; do not compute a new
+  percentage or delta unless the paper states it.
+- **Names, model labels, gene/enzyme names, units and formulas are
+  copied verbatim**, including superscripts/subscripts where the
+  extraction preserves them.
+- Prose may be paraphrased for brevity, but direction and scope cannot
+  change: a correlation must not become a cause; "associated with" must
+  not become "causes"; a sample must not become a population.
+- Hedging words are evidence too. If the source says "may", "suggests" or
+  "in this cohort", the slide keeps the hedge.
+- A claim that combines two sources lists both evidence entries.
 
-## 5. 本文结果与他人结果区分
+## Figure and table binding
 
-- caption 或正文出现 et al.、reproduced、adapted、reprinted、with permission、modified from、来源/引用/转载 等标记时，`is_cited_work=true`。
-- 引用他人的图/结论必须在来源标签或备注中注明出处，禁止与本文方法、本文数据混为一谈。
-- 本文的贡献主张只能由本文证据支撑；文献综述、背景部分的数字只能用于“问题/缺口”页，不得用于“结果”页。
+- Bind the exact id; the builder places the real cropped asset and prints
+  the source label (e.g., "Fig. 3 · p. 6").
+- The claim must match the visual: do not bind a figure to a conclusion it
+  does not show, even if the surrounding prose makes the point.
+- Tables are best-effort extractions. Quote the rows that support the
+  claim; if a cell is garbled or columns are misaligned, disclose it in
+  `uncertainty` and keep the source page so a reviewer can check the
+  original.
+- When an asset is missing or low-resolution (`asset_ok: false`), the
+  slide still binds the evidence; the builder renders the caption and an
+  explicit placeholder — never a generated or substituted image.
 
-## 6. 证据定位（evidence locator）格式
+## Verdict recorded in the final evidence map
 
-每条 evidence 至少包含：
+Each slide's `verbatim_check` is set during QA:
 
-| 字段 | 要求 |
-| --- | --- |
-| `kind` | figure / table / section / page |
-| `id` | 图表编号（section/page 可为 null） |
-| `page` | 论文页码，从 1 开始，必须在页数范围内 |
-| `section` | 章节名（可空），优先取目录（TOC）中的名称 |
-| `quote` | 该页逐字原文片段，用于复核，不做改写 |
-
-- title/section 分隔页可只挂页码定位；其余页至少一条完整证据。
-- 一个主张由多页证据支撑时，列出全部来源；QA 逐页检查，任一缺失即告警。
-
-## 7. 高频失败模式（自检清单）
-
-- 段落切块：把摘要句子按顺序贴进页面，没有主张与证据关系——不接受。
-- 张冠李戴：图编号与正文引用错位，或引用了论文中不存在的编号。
-- 数值漂移：搬运中改写小数位、单位、数量级，或把约数写成精确值。
-- 类型混淆：示意图当数据、他人结果当本文结果、相关关系写成因果结论。
-- 证据缺位：页面有结论但无任何页码/图表定位，无法复核。
-- 过度推断：结论超出图注与原文措辞，把“可能/相关”写成“证明/导致”。
-- 编造表格：无框线/多行长表无法可靠还原时，若硬填猜测单元格即判失败；应改为“见源页 N”指引并在 `uncertainty` 记录。
+- **verified** — every claim and number matches the bound source.
+- **paraphrased** — faithful rewording; direction and scope unchanged.
+- **flagged** — unsupported or inconsistent; the QA report names the
+  problem and the run status is downgraded.
+- **no_claim** — structural slides (title, divider) with no scientific
+  assertion.

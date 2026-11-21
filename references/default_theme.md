@@ -1,53 +1,68 @@
-# 默认学术主题规格（无模板时使用）
+# Default theme: scholar-default
 
-当输入未提供模板/起始 deck 时，构建脚本按本规格生成中性、可编辑的学术版式。规格保持克制，优先可读性与跨平台稳定性，不引入装饰性元素。
+Used only when no template or starting deck is provided. The builder also
+uses these rules as a fallback when a provided template lacks a needed
+layout. All values are deterministic and every font is resolved against
+installed fonts.
 
-## 画布与安全区
+## Canvas
 
-- 尺寸：13.333 × 7.5 英寸（16:9）。
-- 安全区：左 0.6、上 0.55、右 12.73、下 6.95（宽 12.13、高 6.4）。
-- 所有内容不超出安全区；页脚区域（下 0.35 英寸内）默认留空，不添加未被要求的 Logo 或页码装饰。
+- 16:9 widescreen, 13.333 × 7.5 inches (960 × 540 pt).
+- Safe area: left 0.62 in, right 12.72 in, top 0.52 in, bottom 6.92 in.
+  No content crosses the safe area; the QA stage verifies this against
+  rendered previews.
 
-## 配色（学术中性）
+## Palette (deliberately restrained, print-friendly)
 
-| 角色 | 色值 | 用途 |
-| --- | --- | --- |
-| primary | #1F3864（深海军蓝） | 标题、强调文字 |
-| accent | #2E75B6（中蓝） | 结论标记、表头 |
-| text | #262626（近黑） | 正文 |
-| muted | #595959（深灰） | 图注、来源标签 |
-| background | #FFFFFF（白） | 页面底色 |
-| table_header | #1F4E79 底 + 白字 | 原生表头 |
+| Token | Hex | Use |
+|---|---|---|
+| ink | `#1F2A37` | body text, titles |
+| primary | `#173F5F` | deep navy; headers, section bands, title page |
+| accent | `#2E86AB` | steel blue; emphasis, chart key, rules |
+| accent2 | `#E07A5F` | terracotta; sparing highlight for key numbers |
+| soft | `#F4F6F8` | panel/table header fill |
+| rule | `#D9DEE4` | hairlines, table borders |
+| muted | `#6B7785` | captions, source labels, footers |
 
-不使用渐变色块、阴影或彩色背景；需要区分层级时只用字号与留白。
+White background. No gradients, shadows or decorative imagery. Color never
+alone encodes meaning; labels accompany every highlighted element.
 
-## 字体策略
+## Typography
 
-- 拉丁字体：Carlito（与 Calibri 度量兼容）；缺失时回退 Liberation Sans。
-- 中文无衬线：Noto Sans CJK SC；中文衬线（如需）：Noto Serif CJK SC。
-- 字体在运行时由 `resolve_font` 按实际安装情况解析，禁止硬编码未验证的族名。
+- Latin: `Liberation Sans` for titles and UI, `Liberation Serif` for long
+  prose and formulas; CJK: `Noto Sans CJK SC` / `Noto Serif CJK SC`.
+- Sizes (pt): slide title 28; section/divider 34; body 16–18; table 11–13;
+  captions/source labels 10–11; footer 9.
+- Line spacing 1.15–1.25; generous whitespace over dense packing.
+- Fonts are selected through `resolve_font` so an unavailable family is
+  silently replaced by a real installed one and the substitution is
+  logged.
 
-## 字号层级
+## Slide anatomy
 
-| 元素 | 起始 | 收缩下限 | 说明 |
-| --- | --- | --- | --- |
-| 页面标题 | 28pt | 18pt | 加粗，primary 色，最多 2 行 |
-| 正文要点 | 18pt | 11pt | 1.22 倍行距，段后 6pt |
-| 二级要点 | 同正文 | 同正文 | 缩进一级，字号不另减 |
-| 图注 | 10pt | 9pt | muted 色，逐字保留 |
-| 来源标签 | 9pt | 9pt | 安全区左下，muted 色 |
-| 表格 | 13pt | 9pt | 表头加粗，单元格内边距最小化 |
+- **Title slide:** primary band or primary-colored title; paper title,
+  authors, venue/audience line; no body bullets.
+- **Content slide:** claim title top-left in ink; a 1.5pt primary rule
+  under the title; content region split into text and figure/table zones;
+  source label in muted at the bottom-right of the evidence zone.
+- **Divider:** large role label in primary on white; optional section
+  number.
+- **Conclusion:** numbered takeaways in primary; no new evidence.
+- **Backup:** identical anatomy plus a small "Backup" tag in muted.
 
-## 页型与排布
+## Tables and figures
 
-- 标题页：标题居中偏上（约 2.8 英寸处），作者/出处位于其下，30/15pt。
-- 纯文本页：标题 + 要点列表，左对齐，垂直靠上。
-- 单图页：图区位于内容区上部，图注在其下，来源标签在安全区左下；无要点时图区占满内容宽度。
-- 图文页：图占左侧 58% 宽度，要点在右侧 42%，垂直居中。
-- 多图页：2 列网格，每格独立等比缩放，最多 4 张；超出则拆页或按证明力取舍。
-- 表格页：原生 PPT 表格，等宽列，行高自适应；行数超限时收缩字号，仍超限则截断并在 uncertainty 注明。
+- Native PowerPoint tables (real rows/columns, editable), header row on
+  soft fill with ink text, 0.75pt rule borders; no merged decorative
+  cells.
+- Figures are placed as real images, fit (not stretched) into the zone,
+  and the source label cites the bound figure id and page.
+- Long tables are truncated to the rows the claim needs with an explicit
+  "full table in source, p. X" note.
 
-## 备注
+## Template precedence
 
-- 讲者备注不继承任何视觉样式，仅为文本；3-5 句，含过渡、强调点与补充证据。
-- 备注与页面文字的相似度由 QA 检查，超过 0.75 判定为重复，需要重写。
+1. Starting deck: preserve its master, theme and size; edit in place.
+2. Template file: use its layouts and theme; fall back to safe-area
+   geometry only where a layout is missing.
+3. No deck: `scholar-default` as defined here.
